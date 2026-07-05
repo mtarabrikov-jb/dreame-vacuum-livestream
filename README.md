@@ -42,12 +42,12 @@ there is **no conflict and no reboot**.
 | Phase | What it does | State |
 |-------|--------------|-------|
 | **Phase 1** — supervisor + Source A | Safe base viewing. Auto‑starts `video_monitor` on the dock, **auto‑kills it before cleaning** so the robot never reboots. | ✅ **Working** (`make` targets below) |
-| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ⚠️ **Researched, built, and tested — NOT recommended.** The full-frame copy inside `ava` destabilizes the ISP during cleaning (navigation goes blind). See the on-device result in [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
+| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ⛔ **Not achievable on the W10 (hardware limit).** The RGB camera does not stream during cleaning — the single ISP is dedicated to the ToF obstacle sensor. Proven by passive tap and active force; see [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
 
 **Use Phase 1.** It gives a safe, automatic stream from the dock that gets out of the way during
-cleaning. Phase 2 was fully reverse-engineered and implemented, but on-device testing showed the
-in-`ava` frame tap perturbs the camera pipeline during cleaning — it is kept as a documented research
-result, not a recommended feature.
+cleaning. Phase 2 was fully reverse-engineered, built, and tested on the robot; the tap/encoder/build
+are all correct, but the W10 simply doesn't run its RGB camera while cleaning (the one ISP belongs to
+the ToF obstacle sensor then), so there is nothing to stream. Kept as a documented dead end.
 
 ---
 

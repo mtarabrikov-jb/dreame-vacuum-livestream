@@ -39,18 +39,26 @@
 
 #define SYM_OPEN  "_ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii"
 #define SYM_FRAME "_ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE"
+#define SYM_START "_ZN9sunxi_cam8SunxiCam5startEiiiii"
 #define IMAGEFRAME_DATA_OFF 0x20
+// SunxiCam object layout (verified): self+0 = ctx pointer, self+8 = state (3=streaming)
+#define SUNXI_CTX_OFF   0x00
+#define SUNXI_STATE_OFF 0x08
 
 typedef int (*open_fn)(void*, int, int, int, int, int);
 typedef int (*frame_fn)(void*, void*);
+typedef int (*start_fn)(void*, int, int, int, int, int);
 
 enum { MODE_COPY = 0, MODE_META = 1 };
 
 static int g_w = 0, g_h = 0;
 static struct camtap_shm *g_shm = NULL;
-static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0;
+static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0, g_force = 0;
 static int g_cfg = 0;
 static unsigned long long g_seen = 0;
+// saved OpenCamera args, so we can call SunxiCam::start with the same params
+static int g_a1 = 0, g_fourcc = 0, g_a3 = 0;
+static uint64_t g_last_force_ns = 0;
 
 static void camtap_cfg(void) {
 	if (g_cfg) return;
@@ -59,6 +67,7 @@ static void camtap_cfg(void) {
 	if (m && strcmp(m, "meta") == 0) g_mode = MODE_META;
 	const char *e = getenv("CAMTAP_EVERY"); if (e && atoi(e) > 0) g_every = atoi(e);
 	const char *y = getenv("CAMTAP_YONLY"); if (y) g_yonly = atoi(y);
+	const char *f = getenv("CAMTAP_FORCE"); if (f) g_force = atoi(f);
 }
 
 static void camtap_init_shm(void) {
@@ -111,9 +120,39 @@ int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
 	if (!real) real = (open_fn)dlsym(RTLD_NEXT, SYM_OPEN);
 	camtap_cfg();
 	if (width > 0 && height > 0) { g_w = width; g_h = height; }
+	g_a1 = a1; g_fourcc = fourcc; g_a3 = a3;   // save for a possible force-start
 	if (!g_shm) camtap_init_shm();
 	if (g_shm) { g_shm->width = (uint32_t)width; g_shm->height = (uint32_t)height; g_shm->opens++; }
 	return real ? real(self, a1, fourcc, a3, width, height) : -1;
+}
+
+// Variant B: when real GetImageFrame yields no frame, optionally force the
+// SunxiCam into streaming by calling its real start() — but ONLY when it is safe:
+// no context allocated yet (self[0]==NULL) and not already streaming (state!=3),
+// and rate-limited. This avoids the double-calloc / state corruption that a
+// blind start() would cause.
+typedef int (*shutdown_fn)(void*);
+static void maybe_force_start(void *self) {
+	static start_fn real_start = NULL;
+	static shutdown_fn real_shutdown = NULL;
+	if (!g_force || !self) return;
+	void *ctx = *(void **)((char *)self + SUNXI_CTX_OFF);
+	int state = *(volatile int *)((char *)self + SUNXI_STATE_OFF);
+	if (g_shm) { g_shm->sunxi_state = (uint32_t)state; g_shm->sunxi_ctx = ctx ? 1 : 0; }
+	// level 1 (safe): only start when nothing is set up. level 2+ (aggressive):
+	// re-init even if state==3/ctx!=0 (shutdown first to avoid leaking the ctx).
+	if (g_force < 2 && (ctx != NULL || state == 3)) return;
+	uint64_t now = now_ns();
+	uint64_t gap = (g_force >= 2) ? 3000000000ull : 1000000000ull; // slower when aggressive
+	if (now - g_last_force_ns < gap) return;
+	g_last_force_ns = now;
+	if (!real_start) real_start = (start_fn)dlsym(RTLD_NEXT, SYM_START);
+	if (!real_shutdown) real_shutdown = (shutdown_fn)dlsym(RTLD_NEXT, "_ZN9sunxi_cam8SunxiCam8shutdownEv");
+	if (g_force >= 2 && real_shutdown && ctx != NULL) real_shutdown(self); // release old ctx
+	if (real_start && g_w > 0 && g_h > 0) {
+		real_start(self, g_a1, g_fourcc, g_a3, g_w, g_h);
+		if (g_shm) g_shm->forced++;
+	}
 }
 
 int _ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE(void *self, void *frame) {
@@ -122,6 +161,11 @@ int _ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE(void *self, void *fr
 	camtap_cfg();
 	if (!g_shm) camtap_init_shm();
 	if (g_shm) g_shm->calls++;                 // every hook entry (diagnostic)
+	// record SunxiCam state each call (diagnostic), and force-start if configured
+	if (self && g_shm) {
+		g_shm->sunxi_state = (uint32_t)(*(volatile int *)((char *)self + SUNXI_STATE_OFF));
+		g_shm->sunxi_ctx = (*(void **)((char *)self + SUNXI_CTX_OFF)) ? 1 : 0;
+	}
 	int r = real ? real(self, frame) : 0;
 	if (r == 1) {
 		if (g_shm) g_shm->okframes++;          // real delivered a frame
@@ -131,6 +175,8 @@ int _ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE(void *self, void *fr
 				? *(void **)((char *)frame + IMAGEFRAME_DATA_OFF) : NULL;
 			camtap_publish(data, g_w, g_h);
 		}
+	} else {
+		maybe_force_start(self);               // no frame -> try to kick streaming
 	}
 	return r;
 }

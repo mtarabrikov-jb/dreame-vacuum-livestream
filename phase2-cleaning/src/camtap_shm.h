@@ -34,7 +34,10 @@ struct camtap_shm {
 	volatile uint64_t calls;    // 40  GetImageFrame hook entries (diagnostic)
 	volatile uint64_t okframes; // 48  real GetImageFrame returned 1 (diagnostic)
 	volatile uint64_t opens;    // 56  OpenCamera hook entries (diagnostic)
-	uint8_t  data[CAMTAP_MAX_FRAME]; // 64
+	volatile uint32_t sunxi_state; // 64  last observed SunxiCam state (self+8); 3=streaming
+	volatile uint32_t sunxi_ctx;   // 68  1 if SunxiCam ctx (self[0]) allocated
+	volatile uint64_t forced;   // 72  times we force-called SunxiCam::start
+	uint8_t  data[CAMTAP_MAX_FRAME]; // 80
 };
 
 #endif

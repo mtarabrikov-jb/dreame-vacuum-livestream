@@ -1,22 +1,24 @@
 # Phase 2 — streaming during cleaning (Source B)
 
-> ## ⚠️ Result: NOT recommended on this hardware
+> ## ⛔ Result: not achievable on the W10 (hardware limit)
 >
-> This was fully reverse-engineered, built, and **tested on the real robot**. The frame tap itself is
-> verified correct (see below). **But** with the tap active, starting a cleaning job triggers
-> continuous kernel ISP faults (`isp0 frame error, size 0` / `sunxi_isp_reset`), no frames reach
-> either our relay **or** `ava` — the robot navigates **blind**. Removing the tap and repeating the
-> same cleaning on stock `ava` produces zero errors. Copying the full 508 KB frame inside `ava`'s
-> capture thread perturbs the VIN/ISP buffer timing enough to fault the ISP during sustained capture.
+> This was fully reverse-engineered, built, and **tested exhaustively on the real robot** — both a
+> passive tap and an active force. Conclusion: **the RGB camera cannot stream during cleaning on this
+> model**, so there is nothing to show. Use Phase 1 (dock viewing).
 >
-> No reboot occurs (unlike a second camera open), but blinding navigation is unacceptable, so **this
-> is kept as a documented research result, not a shippable feature.** Use Phase 1 for reliable dock
-> viewing. A safe Phase 2 would need a zero-copy (physical/ION buffer) path — see the end of this file
-> and [`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md#on-device-test-result-important--the-tap-as-implemented-is-not-safe-during-cleaning).
-
-**What was verified as correct:** the hook interposes `sunxi_cam::SunxiCam::GetImageFrame`; the shm
-header decoded exactly on-device (`672x504`, size `508032 = 672*504*3/2`, NV21). The mechanism below is
-sound; the problem is the cost of the copy in the capture thread, not the plumbing.
+> Evidence (see [`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md#on-device-test-result-the-real-blocker-the-rgb-camera-does-not-stream-during-cleaning)):
+> - The hook is verified correct — at startup it captured real frames, shm decoded exactly
+>   (`672x504`, `508032 = 672*504*3/2`, NV21).
+> - During cleaning the real `GetImageFrame` returns 0 on every call (`okframes` flat); the SunxiCam
+>   reports `state=3` but its `dqbuf` yields no buffers — the sensor produces nothing.
+> - Forcing `SunxiCam::start()` (even `shutdown()`+`start()` 9× mid-clean) still yielded **zero
+>   frames**.
+> - During cleaning `ava` holds `/dev/video1`+`/dev/video2` (the ToF obstacle sensor), not
+>   `/dev/video0`. The MR813's single ISP is dedicated to the ToF sensor while cleaning, so the RGB
+>   camera physically can't run. That is also why the vendor only allows RGB monitoring when idle.
+>
+> This directory is kept as a documented dead end (the tap mechanism, the CedarX encoder, and the
+> build are all real and correct — there is simply no cleaning-time stream to feed them).
 
 Phase 1 streams from the dock and gets out of the camera's way during cleaning. Phase 2 fills the gap
 **without a second camera open** (which reboots the W10), by tapping the frames `ava` already captures.

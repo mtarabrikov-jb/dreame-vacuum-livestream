@@ -129,15 +129,27 @@ counters:
 - The earlier "copy destabilizes the ISP" reading was **wrong**: in that run `okframes` was 0 too, so
   our `memcpy` never actually executed — the ISP errors were run-to-run camera noise, not caused by us.
 
-**Consequence:** on the W10 there is no continuous camera stream to tap during cleaning. The only way to
-get frames while cleaning would be to turn the AI-camera switch **on** during cleaning (publish
-`ava_msg_ai_camera_switch` with a non-zero byte, so `camera_streamer` calls `SunxiCam::start` and
-streams) — then the tap would capture without a second camera open. On a de-clouded (Valetudo) robot the
-vendor command that normally sends that message (the app's remote-view/cruise feature, Agora-based) is
-gone, so it would have to be forced from inside `ava` (set `this+0xa4=3` / call `SunxiCam::start` from
-the injected lib) — hacky, it fights `camera_streamer`'s own state machine, and its stability during
-cleaning is unproven. Not done on the owner's working robot without an explicit decision. Phase 1 (dock
-viewing) remains the reliable path.
+**Force attempt (tried — does not work).** Instrumenting the SunxiCam object during cleaning showed
+`state = 3` (software says "streaming") and `ctx != NULL` (context allocated), yet the internal
+`dqbuf` returns nothing every time — the sensor produces no frames. So the block is not the software
+switch; it is the **hardware**. The injected lib was then made to force streaming: call the real
+`SunxiCam::start()` (level 1: only when safe; level 2: `shutdown()` + `start()` repeatedly, even when
+`state==3`). Over a cleaning run it forced a re-init 9 times (`forced` counter climbed 1→9) and
+`okframes` **never moved** — zero frames. Notably there was also **no reboot and no ISP error** this
+time, i.e. the forced `start` doesn't even get the RGB pipeline to run.
+
+The reason is sensor/ISP arbitration: during cleaning `ava` holds `/dev/video1` + `/dev/video2` (the
+ToF / obstacle-avoidance path via `ofilm0092`), **not** `/dev/video0`. The MR813 has a single ISP;
+while cleaning it is dedicated to the ToF obstacle sensor, so the RGB camera (OV8856) cannot stream no
+matter what software asks — which is exactly why the vendor gates RGB monitoring to when the robot is
+idle. The earlier one-off reboot with `video_monitor` running during cleaning was that same contention
+(two consumers fighting the one ISP), not our copy.
+
+**Final conclusion: live RGB viewing during cleaning is not achievable on the W10.** It is a hardware
+limit (one ISP, owned by the ToF sensor while cleaning), confirmed by passive tap (nothing streams) and
+by an active force (re-init yields zero frames). The only "fix" would be to disable ToF obstacle
+avoidance during cleaning to free the ISP — which blinds the robot's actual navigation and defeats the
+purpose. **Phase 1 (dock viewing) is the deliverable; Phase 2 is retained as a documented dead end.**
 
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 
