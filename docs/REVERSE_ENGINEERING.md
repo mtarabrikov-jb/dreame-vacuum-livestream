@@ -138,18 +138,27 @@ switch; it is the **hardware**. The injected lib was then made to force streamin
 `okframes` **never moved** — zero frames. Notably there was also **no reboot and no ISP error** this
 time, i.e. the forced `start` doesn't even get the RGB pipeline to run.
 
-The reason is sensor/ISP arbitration: during cleaning `ava` holds `/dev/video1` + `/dev/video2` (the
-ToF / obstacle-avoidance path via `ofilm0092`), **not** `/dev/video0`. The MR813 has a single ISP;
-while cleaning it is dedicated to the ToF obstacle sensor, so the RGB camera (OV8856) cannot stream no
-matter what software asks — which is exactly why the vendor gates RGB monitoring to when the robot is
-idle. The earlier one-off reboot with `video_monitor` running during cleaning was that same contention
-(two consumers fighting the one ISP), not our copy.
+**What actually streams during cleaning (ioctl tap).** Interposing `ioctl()` and counting `VIDIOC_DQBUF`
+per `/dev/videoN` during cleaning gave the precise picture (note: the platform has **two** ISP pipelines
+— `sunxi_isp.0` + `sunxi_isp.1`, two CSI/MIPI, sensors `ofilm0092` and `ov8856_mipi` — so there is *no*
+single-ISP contention; the earlier "one ISP" reading was wrong):
 
-**Final conclusion: live RGB viewing during cleaning is not achievable on the W10.** It is a hardware
-limit (one ISP, owned by the ToF sensor while cleaning), confirmed by passive tap (nothing streams) and
-by an active force (re-init yields zero frames). The only "fix" would be to disable ToF obstacle
-avoidance during cleaning to free the ISP — which blinds the robot's actual navigation and defeats the
-purpose. **Phase 1 (dock viewing) is the deliverable; Phase 2 is retained as a documented dead end.**
+- `/dev/video2` = the **RGB** camera (verified: its `VIDIOC_S_FMT` is `672x504 NV21`, sizeimage
+  `508032`). It is opened during cleaning but **does not dequeue** — `dqbuf[2]` stays flat. The RGB
+  camera is simply not enabled while cleaning (the AI-camera switch is off), and forcing
+  `SunxiCam::start()` did not make it queue/stream.
+- `/dev/video1` = the **ToF / depth sensor** path. It **does** stream during cleaning: `dqbuf[1]` climbed
+  0→167 in ~26 s (~8 fps). But its `S_FMT` is `224x1558`, fourcc **`BG12`** (12-bit Bayer/raw),
+  sizeimage `698368` — i.e. **raw ToF sensor data** (a tall stack of phase sub-frames), not a viewable
+  image. Turning it into even a coarse depth map needs the proprietary ToF reconstruction pipeline.
+
+**Final conclusion: you cannot watch a normal video of the cleaning on the W10.** The only thing that
+streams while cleaning is raw ToF/depth data (`video1`, not a picture); the watchable RGB camera
+(`video2`) is kept off during autonomous cleaning by the firmware (the OV8856 is the vendor's
+*remote-monitoring* camera, used when idle), and no software force got it to produce frames. Tapping
+`video1` is possible but yields raw depth sensor data, not a camera view. **Phase 1 (dock viewing) is
+the deliverable; Phase 2 is retained as a documented dead end.** The tap, ioctl instrumentation, and
+CedarX encoder are all correct and reusable — there is just no cleaning-time camera image to feed them.
 
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 

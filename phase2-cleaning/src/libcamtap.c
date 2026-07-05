@@ -114,6 +114,47 @@ static void camtap_publish(const void *nv21, int w, int h) {
 	g_shm->seq++;                 // -> even
 }
 
+// --- diagnostic: intercept ioctl to see which /dev/videoN ava dequeues from ---
+// VIDIOC_DQBUF is _IOWR('V',17,struct v4l2_buffer): type byte 'V'=0x56, nr=17.
+// We match on (type,nr) so we don't depend on the struct size. v4l2_buffer has
+// bytesused at offset 8 (u32). This answers "what streams during cleaning".
+typedef int (*ioctl_fn)(int, unsigned long, void *);
+static signed char g_fddev[4096];   // 0=unknown, -2=not-video, (num+1) for videoN
+static int fd_videonum(int fd) {
+	if (fd < 0 || fd >= (int)sizeof(g_fddev)) return -1;
+	signed char c = g_fddev[fd];
+	if (c != 0) return (c == -2) ? -1 : (c - 1);
+	char path[64], tgt[128];
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+	if (n <= 0) return -1;                            // transient, don't cache
+	tgt[n] = 0;
+	int num = (strncmp(tgt, "/dev/video", 10) == 0) ? atoi(tgt + 10) : -1;
+	g_fddev[fd] = (num >= 0 && num < 4) ? (signed char)(num + 1) : -2;
+	return (num >= 0 && num < 4) ? num : -1;
+}
+
+int ioctl(int fd, unsigned long req, void *arg);
+int ioctl(int fd, unsigned long req, void *arg) {
+	static ioctl_fn real = NULL;
+	if (!real) real = (ioctl_fn)dlsym(RTLD_NEXT, "ioctl");
+	int r = real ? real(fd, req, arg) : -1;
+	if (r == 0 && ((req >> 8) & 0xff) == 0x56 && arg && g_shm) {
+		unsigned nr = req & 0xff;
+		if (nr == 17) {                              // VIDIOC_DQBUF
+			int v = fd_videonum(fd);
+			if (v >= 0 && v < 4) {
+				g_shm->dqbuf[v]++;
+				g_shm->dqbytes[v] = *(uint32_t *)((char *)arg + 8); // bytesused
+			}
+		} else if (nr == 5 || nr == 4) {             // VIDIOC_S_FMT / G_FMT
+			int v = fd_videonum(fd);
+			if (v >= 0 && v < 4) memcpy((void *)g_shm->vfmt[v], arg, 64);
+		}
+	}
+	return r;
+}
+
 int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
                                              int a3, int width, int height) {
 	static open_fn real = NULL;

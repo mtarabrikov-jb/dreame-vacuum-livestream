@@ -37,7 +37,10 @@ struct camtap_shm {
 	volatile uint32_t sunxi_state; // 64  last observed SunxiCam state (self+8); 3=streaming
 	volatile uint32_t sunxi_ctx;   // 68  1 if SunxiCam ctx (self[0]) allocated
 	volatile uint64_t forced;   // 72  times we force-called SunxiCam::start
-	uint8_t  data[CAMTAP_MAX_FRAME]; // 80
+	volatile uint64_t dqbuf[4]; // 80,88,96,104  VIDIOC_DQBUF count per /dev/videoN
+	volatile uint32_t dqbytes[4]; // 112,116,120,124  last bytesused per /dev/videoN
+	uint8_t  vfmt[4][64];       // 128  raw v4l2_format bytes from S_FMT per /dev/videoN
+	uint8_t  data[CAMTAP_MAX_FRAME]; // 384
 };
 
 #endif
