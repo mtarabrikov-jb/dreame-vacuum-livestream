@@ -96,6 +96,7 @@ int main(int argc, char **argv) {
 	static unsigned char frame[CAMTAP_MAX_FRAME];
 	static unsigned char gray[IR_SUB * TOF_W];
 	static unsigned char big[IR_SUB * TOF_W * 16];       // IR upscale, up to scale 4
+	static unsigned char nv21[IR_SUB * TOF_W * 16 * 3 / 2]; // IR as NV21 (Y + neutral UV)
 	static unsigned char jpg[2 * 1024 * 1024];
 	int w = 0, h = 0, fmt = 0, size = 0;
 	uint64_t last = 0;
@@ -128,10 +129,15 @@ int main(int argc, char **argv) {
 		while (!g_stop) {
 			if (!read_frame(shm, frame, sizeof frame, &w, &h, &fmt, &size, &l2)) { usleep(6000); continue; }
 			int n;
-			if (fmt == 100) {                       // ToF -> grayscale infrared (cleaning)
+			if (fmt == 100) {                       // ToF -> infrared (cleaning)
 				tof_to_gray((const uint16_t *)frame, band, gray);
 				ir_upscale(gray, TOF_W, IR_SUB, scale, big);
-				n = jpeg_encode_gray(big, TOF_W * scale, IR_SUB * scale, qual, jpg);
+				int iw = TOF_W * scale, ih = IR_SUB * scale;
+				// encode as YCbCr with neutral chroma (visually gray) — go2rtc's MJPEG
+				// transcoder panics on a 1-component grayscale JPEG (expects YCbCr).
+				memcpy(nv21, big, (size_t)iw * ih);
+				memset(nv21 + iw * ih, 128, (size_t)iw * ih / 2);
+				n = jpeg_encode_nv21(nv21, iw, ih, qual, jpg);
 			} else {                                // NV21 -> full color (docked)
 				n = jpeg_encode_nv21(frame, w, h, qual, jpg);
 			}
