@@ -63,18 +63,71 @@ resets. **Source A must be killed before the robot starts cleaning** — which i
 `supervisor.sh` does (it only runs Source A in state `docked`). Streaming during cleaning must
 therefore *not* open the camera again — hence Phase 2 taps the existing internal frames instead.
 
-## 5. `ava` internal IPC bus (Phase 2 target)
+## 5. How Phase 2 taps camera frames (verified)
 
-- Transport: **nanomsg** (`libnanomsg.so.5`) over `ipc:///tmp/avamsg.socket`, wrapped by
-  `libmessenger.so`.
-- Messages are "raknetmessage"s: a type discriminator readable via `getMsgType`, and a
-  **CRC16-Modbus** integrity field (same CRC the MCU protocol uses; init `0xFFFF`, poly `0xA001`).
-- During cleaning, `camera_streamer` publishes the AI frame as **`ava_ai_camera_msg`** (NV21) to the
-  AI node on this bus. That is the frame Phase 2 subscribes to — passively, without opening the
-  camera.
-- Still **TODO** for Phase 2: the numeric message type id, and the exact payload header offsets
-  (width/height/stride/format/timestamp) before the NV21 bytes. `ava_cam_relay --dump` on the robot
-  during cleaning prints message lengths/types to pin these down.
+The first hypothesis — subscribe to an external nanomsg bus `ipc:///tmp/avamsg.socket` — was **wrong
+for this firmware** and is recorded here so nobody repeats it:
+
+- `libmessenger.so` contains the string `ipc:///tmp/avamsg.socket`, but the socket is **never bound**:
+  `/proc/net/unix` on a running robot shows only `avacmd.socket`, `avaexec.socket`,
+  `videomonitor.socket` — no `avamsg.socket`. `libmessenger.so` does not even import `nn_*`.
+- `ava` is **monolithic**: one process (`/usr/bin/ava`) dlopens every `node_*.so`. `camera_streamer`
+  publishes `ava::Publisher<ava_ai_camera_msg>` **in-process** to `node_camera_ai` (MNN). There is no
+  external subscriber, so the bus carrying frames is never exposed.
+
+The frames therefore have to be tapped **inside** `ava`. The clean, interposable boundary:
+
+- `node_camera_streamer.so` is NEEDED-linked against **`libsunxicamera.so`** and calls, across the
+  `.so` boundary (so LD_PRELOAD can interpose them), the exported symbols:
+  - `sunxi_cam::SunxiCam::OpenCamera(self, a1, fourcc, a3, width, height)` — the 4th/5th int args
+    are width/height (verified: `CCameraModeSuxi::OpenCamera` stores them at `this+0x120/0x124` then
+    tail-calls SunxiCam::OpenCamera).
+  - `sunxi_cam::SunxiCam::GetImageFrame(self, ImageFrame* out)` — called once per captured frame.
+
+`ImageFrame` layout, from disassembling `libsunxicamera.so::GetImageFrame` (it copies fields out of a
+72-byte internal buffer):
+
+```c
+struct sunxi_cam::ImageFrame {   // 0x28 bytes
+    uint64_t f00;   // +0x00  (buf+0x30)
+    uint64_t f08;   // +0x08  (buf+0x34)
+    uint64_t f10;   // +0x10  (buf+0x38)
+    void    *p18;   // +0x18  (buf+0x40)  physical addr?
+    void    *data;  // +0x20  (buf+0x00)  <-- NV21 virtual pointer
+};
+```
+
+The caller `CCameraModeSuxi::GetImageFrame` confirms the semantics: it computes
+`size = width*height*3/2` (the disasm literally does `w*h`, `*3`, `/2` — **NV21**) and `memcpy`s from
+`ImageFrame+0x20`. So: **hook `GetImageFrame`, read `*(void**)(frame+0x20)`, size `w*h*3/2`.** That is
+exactly what `libcamtap.so` does; the width/height come from the `OpenCamera` hook.
+
+The tap runs inside `ava` and must be minimal and defensive — it does a single `memcpy` of the frame
+into a tmpfs seqlock buffer (`/tmp/camtap.shm`) and returns. All encoding/network happens in a
+separate process (`ava_cam_relay`) so a bug there can never crash navigation.
+
+## 5a. H264 encoder (CedarX `libvencoder.so`)
+
+`ava_cam_relay` encodes the tapped NV21 with the SoC's hardware encoder. `/usr/lib/libvencoder.so` is
+the stock CedarX encoder wrapper — NEEDED-linked against `libvenc_codec.so`, `libvenc_base.so`,
+`libVE.so`, `libcdc_base.so`, `libMemAdapter.so` — exposing the classic Allwinner `VideoEnc*` C API
+(`VideoEncCreate` / `VideoEncInit` / `AllocInputBuffer` / `GetOneAllocInputBuffer` /
+`FlushCacheAllocInputBuffer` / `AddOneInputBuffer` / `VideoEncodeOneFrame` / `GetOneBitstreamFrame`).
+We `dlopen` it. `VencBaseConfig` offsets used were checked against a disassembly of `VideoEncInit`
+(`nDstWidth@0x0c` is compared to `0xEFF`=3839 as a max; `nDstHeight@0x10`; the wrapper fills the
+memops/veops pointers at `0x20/0x28/0x30` itself). Input format for NV21 = `VENC_PIXEL_YVU420SP` (1).
+The frame plumbing is stable; the H264 rate/GOP *parameter indices* are the standard enum values and
+are the one thing worth confirming on-device.
+
+## 5b. Injecting the tap into `ava`
+
+`ava` starts from `/etc/rc.d/ava.sh` (`ava -f /ava/conf/r2104.conf force &`), `/usr/bin/ava` on the
+read-only squashfs. There is no `/etc/ld.so.preload` and `/etc` can't be written. So the tap is
+injected by **bind-mounting a wrapper over `/usr/bin/ava`**: the wrapper sets
+`LD_PRELOAD=/data/camstream/libcamtap.so` and `exec`s a copy of the real `ava`. `ava.sh` then launches
+our wrapper. This is opt-in and **restarts `ava`** (the navigation brain) — do it with the robot idle
+on the dock; recover with `inject-ava.sh remove` over SSH. Persistence is a marked block in
+`_root_postboot.sh` that re-applies the bind mount at boot.
 
 ## 6. The config overlay (why `install.sh` bind-mounts `/ava/conf`)
 

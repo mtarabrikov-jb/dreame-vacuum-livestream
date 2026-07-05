@@ -1,193 +1,235 @@
 // ---------------------------------------------------------------------------
-// ava_cam_relay — Source B for streaming DURING cleaning (Phase 2, SCAFFOLD)
+// ava_cam_relay — Source B encoder/relay  (Phase 2, out-of-ava process)
 //
-// Idea: while the robot cleans, `ava` already opens the camera and publishes
-// NV21 frames to its AI-navigation node over an internal nanomsg bus
-// (ipc:///tmp/avamsg.socket). Instead of opening the camera a SECOND time (which
-// reboots the W10 — see docs/REVERSE_ENGINEERING.md), we passively SUBSCRIBE to
-// that bus, pull the frames ava is already producing, encode them to H264 and
-// serve them on 127.0.0.1:6969 for go2rtc — exactly the socket Source A uses, so
-// the supervisor can hot-swap A<->B without go2rtc noticing.
+// Reads NV21 frames that libcamtap.so (LD_PRELOAD'd into ava) drops into the
+// tmpfs seqlock buffer /tmp/camtap.shm, encodes them to H264 with the SoC's
+// hardware encoder (CedarX libvencoder.so), and serves the H264 on
+// 127.0.0.1:6969 — the SAME socket Source A (video_monitor) uses, so go2rtc and
+// the supervisor treat A and B identically.
 //
-//   ava (camera_streamer)  --NV21-->  [avamsg bus]  --> ava_cam_relay
-//                                                          |  encode H264 (CedarX)
-//                                                          v
-//                                                     TCP :6969  --> go2rtc
+//   ava + libcamtap.so ──NV21──▶ /tmp/camtap.shm ──▶ ava_cam_relay ──H264──▶ :6969 ──▶ go2rtc
 //
-// WHAT WORKS in this file:
-//   * connect to the nanomsg bus, receive loop, CRC16 framing helper
-//   * a complete TCP server on :6969 that go2rtc connects to
-//   * --dump mode: prints len/type/first-bytes of the first bus messages so you
-//     can VERIFY the subscription on-device and identify the camera message.
+// Running as a SEPARATE process means a bug here can never crash ava (the
+// robot's navigation). It also uses the video engine only while cleaning, when
+// nothing else encodes, so there is no HW contention.
 //
-// WHAT IS TODO (the reverse-engineering that still has to be finished):
-//   [TODO-1] MSGTYPE_AVA_AI_CAMERA — the numeric raknetmessage type id to filter.
-//   [TODO-2] struct ava_cam_hdr    — exact width/height/stride/format/ts offsets.
-//   [TODO-3] nv21_to_h264()        — hardware H264 via libvencoder (CedarX).
+// Modes:
+//   ava_cam_relay            encode + serve on :6969
+//   ava_cam_relay --stats    just report the tap (fps/size) — validates
+//                            libcamtap without needing the encoder. Use this
+//                            first to confirm frames are flowing.
 //
-// nanomsg is linked directly against the ROBOT's libnanomsg.so.5 (pulled with
-// `make pull-libs`) rather than dlopen'd, so no dlopen@GLIBC_2.34 dependency is
-// introduced on newer build hosts. See phase2-cleaning/Makefile.
-//
-// Build:  see ../Makefile   (cross-compiles to aarch64 with clang)
-// Run  :  ./ava_cam_relay [--dump]   (on the robot, while it is CLEANING)
+// The frame tap + NV21 layout are fully reverse-engineered/verified. The CedarX
+// H264 parameter tuning is the one part to confirm on-device (see vencoder.h).
 // ---------------------------------------------------------------------------
-
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <dlfcn.h>
 #include <signal.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "camtap_shm.h"
+#include "vencoder.h"
 
-// ---- nanomsg (declared here; linked against the robot's libnanomsg.so.5) ---
-#define NN_AF_SP     1
-#define NN_PROTO_BUS 7
-#define NN_BUS       (NN_PROTO_BUS * 16 + 0)   // 112
-#define NN_MSG       ((size_t)-1)
-// If the bus turns out to be PUB/SUB rather than BUS, switch to NN_SUB (2*16+1)
-// and call nn_setsockopt(s, NN_SUB, NN_SUB_SUBSCRIBE, "", 0) after connect.
-extern int  nn_socket(int domain, int protocol);
-extern int  nn_connect(int s, const char *addr);
-extern int  nn_recv(int s, void *buf, size_t len, int flags);
-extern int  nn_freemsg(void *msg);
-extern int  nn_close(int s);
-extern const char *nn_strerror(int errnum);
-
-// ---- CRC16-Modbus (ava wraps messages with this; used to validate frames) --
-static uint16_t crc16_modbus(const uint8_t *d, size_t n) {
-	uint16_t crc = 0xFFFF;
-	for (size_t i = 0; i < n; i++) {
-		crc ^= d[i];
-		for (int b = 0; b < 8; b++)
-			crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-	}
-	return crc;
-}
-
-// ---- [TODO-1] message type of the AI camera frame --------------------------
-// ava wraps every bus message as a "raknetmessage" whose first bytes encode a
-// type (getMsgType). camera_streamer publishes the AI frame under a specific
-// type id. Find it: run with --dump during cleaning and correlate the big,
-// ~15fps messages that appear only while cleaning.
-#define MSGTYPE_AVA_AI_CAMERA   0xFFFF   /* TODO: replace with real id */
-
-// ---- [TODO-2] payload header of an ava_ai_camera_msg -----------------------
-// Fill these offsets from the capture. NV21 = YUV420SP: a W*H Y plane followed
-// by a W*H/2 interleaved VU plane, so payload = W*H*3/2 (+ this header).
-struct ava_cam_hdr {
-	uint16_t type;      // getMsgType — compare to MSGTYPE_AVA_AI_CAMERA
-	// uint32_t width;  // TODO offset
-	// uint32_t height; // TODO offset
-	// uint32_t stride; // TODO offset
-	// uint64_t ts_us;  // TODO offset
-	// uint8_t  nv21[];  // TODO: Y plane (w*h) + VU plane (w*h/2)
-};
-
-// ---- [TODO-3] NV21 -> H264 via CedarX libvencoder --------------------------
-// The robot has libvencoder.so (Allwinner CedarX HW encoder). Bind these and
-// feed NV21 in, get an H264 Annex-B NAL out. This is the last missing piece.
-//   VideoEncoder *VideoEncCreate(VENC_CODEC_TYPE);   // VENC_CODEC_H264
-//   int VideoEncInit(VideoEncoder*, VencBaseConfig*);// nInputYuvFmt=VENC_PIXEL_YVU420SP
-//   AllocInputBuffer / FillInputBuffer / VideoEncodeOneFrame / GetOneBitstreamFrame
-// Known-good params (vacuumstreamer recorder.cfg): 864x480 @15fps YVU420SP.
-static int nv21_to_h264(const uint8_t *nv21, int w, int h,
-                        uint8_t *out, int out_cap) {
-	(void)nv21; (void)w; (void)h; (void)out; (void)out_cap;
-	return -1; // TODO: not implemented yet
-}
-
-// ---- TCP server on :6969 (go2rtc connects here) — this part is complete ----
 static volatile int g_stop = 0;
 static void on_sig(int s){ (void)s; g_stop = 1; }
 
+// ---- open the tmpfs frame buffer written by libcamtap ----------------------
+static struct camtap_shm *open_shm(void) {
+	int fd = open(CAMTAP_SHM_PATH, O_RDWR);
+	if (fd < 0) return NULL;
+	void *p = mmap(NULL, sizeof(struct camtap_shm), PROT_READ | PROT_WRITE,
+	               MAP_SHARED, fd, 0);
+	close(fd);
+	return (p == MAP_FAILED) ? NULL : (struct camtap_shm *)p;
+}
+
+// ---- consistent read of one frame via the seqlock --------------------------
+// Returns 1 and fills out/w/h if a NEW frame (seq/frames advanced) was read.
+static int read_frame(struct camtap_shm *shm, uint8_t *out, int cap,
+                      int *w, int *h, int *size, uint64_t *last_frames) {
+	uint32_t s0 = shm->seq;
+	if (s0 & 1u) return 0;                 // writer mid-update
+	__sync_synchronize();
+	uint64_t fr = shm->frames;
+	if (fr == *last_frames) return 0;       // nothing new
+	int ww = shm->width, hh = shm->height, sz = shm->size;
+	if (sz <= 0 || sz > cap) return 0;
+	memcpy(out, shm->data, (size_t)sz);
+	__sync_synchronize();
+	if (shm->seq != s0) return 0;           // torn read, try again next tick
+	*w = ww; *h = hh; *size = sz; *last_frames = fr;
+	return 1;
+}
+
+// ---- TCP server on :6969 (go2rtc connects here) ----------------------------
 static int tcp_listen(int port) {
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	int one = 1;
+	int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	struct sockaddr_in a;
-	memset(&a, 0, sizeof(a));
-	a.sin_family = AF_INET;
-	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
+	struct sockaddr_in a; memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	a.sin_port = htons(port);
 	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) < 0) { perror("bind :6969"); return -1; }
 	if (listen(fd, 1) < 0) { perror("listen"); return -1; }
 	return fd;
 }
 
-int main(int argc, char **argv) {
-	int dump = (argc > 1 && strcmp(argv[1], "--dump") == 0);
-	signal(SIGINT, on_sig);
-	signal(SIGTERM, on_sig);
-	signal(SIGPIPE, SIG_IGN);
+// ---- CedarX encoder (dlopen libvencoder.so) --------------------------------
+struct enc {
+	void *lib, *venc;
+	fn_VideoEncCreate            Create;
+	fn_VideoEncInit              Init;
+	fn_VideoEncSetParameter      SetParam;
+	fn_AllocInputBuffer          Alloc;
+	fn_GetOneAllocInputBuffer    GetIn;
+	fn_FlushCacheAllocInputBuffer Flush;
+	fn_AddOneInputBuffer         AddIn;
+	fn_VideoEncodeOneFrame       Encode;
+	fn_AlreadyUsedInputBuffer    Used;
+	fn_ReturnOneAllocInputBuffer RetIn;
+	fn_GetOneBitstreamFrame      GetBits;
+	fn_FreeOneBitStreamFrame     FreeBits;
+	fn_VideoEncUnInit            UnInit;
+	fn_VideoEncDestroy           Destroy;
+};
 
-	int bus = nn_socket(NN_AF_SP, NN_BUS);
-	if (bus < 0) { fprintf(stderr, "nn_socket failed\n"); return 1; }
-	const char *ep = "ipc:///tmp/avamsg.socket";
-	if (nn_connect(bus, ep) < 0) {
-		fprintf(stderr, "nn_connect %s failed: %s\n", ep, nn_strerror(errno));
-		return 1;
+static int enc_load(struct enc *e) {
+	memset(e, 0, sizeof(*e));
+	e->lib = dlopen("libvencoder.so", RTLD_NOW | RTLD_GLOBAL);
+	if (!e->lib) { fprintf(stderr, "dlopen libvencoder: %s\n", dlerror()); return -1; }
+	// resolve by the library's real export names
+	*(void**)&e->Create   = dlsym(e->lib, "VideoEncCreate");
+	*(void**)&e->Init     = dlsym(e->lib, "VideoEncInit");
+	*(void**)&e->SetParam = dlsym(e->lib, "VideoEncSetParameter");
+	*(void**)&e->Alloc    = dlsym(e->lib, "AllocInputBuffer");
+	*(void**)&e->GetIn    = dlsym(e->lib, "GetOneAllocInputBuffer");
+	*(void**)&e->Flush    = dlsym(e->lib, "FlushCacheAllocInputBuffer");
+	*(void**)&e->AddIn    = dlsym(e->lib, "AddOneInputBuffer");
+	*(void**)&e->Encode   = dlsym(e->lib, "VideoEncodeOneFrame");
+	*(void**)&e->Used     = dlsym(e->lib, "AlreadyUsedInputBuffer");
+	*(void**)&e->RetIn    = dlsym(e->lib, "ReturnOneAllocInputBuffer");
+	*(void**)&e->GetBits  = dlsym(e->lib, "GetOneBitstreamFrame");
+	*(void**)&e->FreeBits = dlsym(e->lib, "FreeOneBitStreamFrame");
+	*(void**)&e->UnInit   = dlsym(e->lib, "VideoEncUnInit");
+	*(void**)&e->Destroy  = dlsym(e->lib, "VideoEncDestroy");
+	if (!e->Create || !e->Init || !e->GetIn || !e->Encode || !e->GetBits) {
+		fprintf(stderr, "libvencoder missing required symbols\n"); return -1;
 	}
-	fprintf(stderr, "connected to %s\n", ep);
-
-	int srv = tcp_listen(6969);
-	if (srv < 0) return 1;
-	fprintf(stderr, "serving H264 on 127.0.0.1:6969 (waiting for go2rtc)\n");
-
-	int client = -1;
-	unsigned long long frames = 0, cam_frames = 0;
-	static uint8_t h264[512 * 1024];
-
-	while (!g_stop) {
-		// lazily accept go2rtc without blocking the recv loop
-		if (client < 0) {
-			struct timeval tv = {0, 0};
-			fd_set r; FD_ZERO(&r); FD_SET(srv, &r);
-			if (select(srv + 1, &r, NULL, NULL, &tv) > 0)
-				client = accept(srv, NULL, NULL);
-		}
-
-		void *buf = NULL;
-		int n = nn_recv(bus, &buf, NN_MSG, 0);
-		if (n < 0) { if (errno == EINTR) continue; usleep(2000); continue; }
-		frames++;
-
-		const uint8_t *m = (const uint8_t*)buf;
-		uint16_t type = (n >= 2) ? (uint16_t)(m[0] | (m[1] << 8)) : 0xFFFF;
-
-		if (dump && frames <= 40) {
-			fprintf(stderr, "msg #%llu len=%d type=0x%04x  %02x %02x %02x %02x %02x %02x\n",
-			        frames, n, type,
-			        n>0?m[0]:0, n>1?m[1]:0, n>2?m[2]:0, n>3?m[3]:0, n>4?m[4]:0, n>5?m[5]:0);
-		}
-
-		// [TODO-1] once MSGTYPE_AVA_AI_CAMERA is known, gate on it:
-		if (type == MSGTYPE_AVA_AI_CAMERA) {
-			cam_frames++;
-			// [TODO-2] parse struct ava_cam_hdr -> w,h and NV21 pointer
-			// [TODO-3] int len = nv21_to_h264(nv21, w, h, h264, sizeof h264);
-			int len = nv21_to_h264(NULL, 0, 0, h264, sizeof h264);
-			if (len > 0 && client >= 0) {
-				if (write(client, h264, len) < 0) { close(client); client = -1; }
-			}
-			if (cam_frames % 30 == 0)
-				fprintf(stderr, "camera frames seen: %llu\n", cam_frames);
-		}
-
-		nn_freemsg(buf);
-	}
-
-	fprintf(stderr, "stopping: %llu msgs, %llu camera frames\n", frames, cam_frames);
-	if (client >= 0) close(client);
-	close(srv);
-	nn_close(bus);
 	return 0;
 }
 
-// Suppress unused-function warning until the CRC check is wired into [TODO-2].
-static void (*const _keep_crc)(void) __attribute__((unused)) = (void(*)(void))crc16_modbus;
+static int enc_init(struct enc *e, int w, int h, int fps, int kbps) {
+	e->venc = e->Create(VENC_CODEC_H264);
+	if (!e->venc) { fprintf(stderr, "VideoEncCreate failed\n"); return -1; }
+	int fr = fps, br = kbps * 1000, gop = fps * 2;
+	if (e->SetParam) {
+		e->SetParam(e->venc, VENC_IndexParamFramerate, &fr);
+		e->SetParam(e->venc, VENC_IndexParamBitrate, &br);
+		e->SetParam(e->venc, VENC_IndexParamMaxKeyInterval, &gop);
+	}
+	VencBaseConfig base; memset(&base, 0, sizeof(base));
+	base.nInputWidth = base.nDstWidth = (uint32_t)w;
+	base.nInputHeight = base.nDstHeight = (uint32_t)h;
+	base.nStride = (uint32_t)w;
+	base.eInputFormat = VENC_PIXEL_YVU420SP;         // NV21
+	if (e->Init(e->venc, &base) != 0) { fprintf(stderr, "VideoEncInit failed\n"); return -1; }
+	VencAllocateBufferParam ap; memset(&ap, 0, sizeof(ap));
+	ap.nBufferNum = 4; ap.nSizeY = (uint32_t)(w*h); ap.nSizeC = (uint32_t)(w*h/2);
+	if (e->Alloc) e->Alloc(e->venc, &ap);
+	fprintf(stderr, "encoder ready %dx%d @%dfps %dkbps\n", w, h, fps, kbps);
+	return 0;
+}
+
+// Encode one NV21 frame; write H264 to client. Returns 0 ok, -1 fatal.
+static int enc_frame(struct enc *e, const uint8_t *nv21, int w, int h, int client) {
+	VencInputBuffer in; memset(&in, 0, sizeof(in));
+	if (e->GetIn(e->venc, &in) != 0) return 0;       // no free buffer this tick
+	if (in.pAddrVirY) memcpy(in.pAddrVirY, nv21, (size_t)(w*h));
+	if (in.pAddrVirC) memcpy(in.pAddrVirC, nv21 + w*h, (size_t)(w*h/2));
+	if (e->Flush) e->Flush(e->venc, &in);
+	if (e->AddIn) e->AddIn(e->venc, &in);
+	e->Encode(e->venc);
+	if (e->Used)  e->Used(e->venc, &in);
+	if (e->RetIn) e->RetIn(e->venc, &in);
+
+	VencOutputBuffer out; memset(&out, 0, sizeof(out));
+	if (e->GetBits(e->venc, &out) == 0) {
+		if (client >= 0) {
+			if (out.pData0 && out.nSize0 && write(client, out.pData0, out.nSize0) < 0) return -1;
+			if (out.pData1 && out.nSize1 && write(client, out.pData1, out.nSize1) < 0) return -1;
+		}
+		if (e->FreeBits) e->FreeBits(e->venc, &out);
+	}
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	int stats = (argc > 1 && strcmp(argv[1], "--stats") == 0);
+	int fps = 15, kbps = 2000;
+	signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
+
+	struct camtap_shm *shm = NULL;
+	for (int i = 0; i < 50 && !shm && !g_stop; i++) {   // wait for the tap to appear
+		shm = open_shm();
+		if (!shm) usleep(200000);
+	}
+	if (!shm || shm->magic != CAMTAP_MAGIC) {
+		fprintf(stderr, "no %s yet (is libcamtap active in ava, and is it cleaning?)\n", CAMTAP_SHM_PATH);
+		return 1;
+	}
+	fprintf(stderr, "attached to %s\n", CAMTAP_SHM_PATH);
+
+	static uint8_t frame[CAMTAP_MAX_FRAME];
+	uint64_t last = 0; int w = 0, h = 0, size = 0;
+
+	if (stats) {   // diagnostic: prove the tap works, no encoder
+		uint64_t t0 = 0, cnt = 0;
+		while (!g_stop) {
+			if (read_frame(shm, frame, sizeof frame, &w, &h, &size, &last)) {
+				if (!t0) t0 = shm->ts_ns;
+				cnt++;
+				if (cnt % 15 == 0)
+					fprintf(stderr, "tap: %dx%d %d bytes, %llu frames total\n",
+					        w, h, size, (unsigned long long)shm->frames);
+			}
+			usleep(3000);
+		}
+		return 0;
+	}
+
+	struct enc e;
+	if (enc_load(&e) != 0) return 1;
+	int srv = tcp_listen(6969);
+	if (srv < 0) return 1;
+	fprintf(stderr, "serving H264 on 127.0.0.1:6969\n");
+
+	int client = -1, inited = 0;
+	while (!g_stop) {
+		if (client < 0) {
+			struct timeval tv = {0, 0}; fd_set r; FD_ZERO(&r); FD_SET(srv, &r);
+			if (select(srv+1, &r, NULL, NULL, &tv) > 0) client = accept(srv, NULL, NULL);
+		}
+		if (read_frame(shm, frame, sizeof frame, &w, &h, &size, &last)) {
+			if (!inited) { if (enc_init(&e, w, h, fps, kbps) != 0) break; inited = 1; }
+			if (client >= 0 && enc_frame(&e, frame, w, h, client) < 0) { close(client); client = -1; }
+		}
+		usleep(3000);
+	}
+
+	if (client >= 0) close(client);
+	close(srv);
+	if (inited && e.UnInit) e.UnInit(e.venc);
+	if (inited && e.Destroy) e.Destroy(e.venc);
+	return 0;
+}

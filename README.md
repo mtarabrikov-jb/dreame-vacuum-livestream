@@ -29,10 +29,11 @@ This project solves that with **two sources and a supervisor that switches betwe
 | Robot state        | Source                                        | Camera owner |
 |--------------------|-----------------------------------------------|--------------|
 | docked / idle      | **A:** `video_monitor` opens the camera       | `video_monitor` |
-| cleaning / moving  | **B:** subscribe to the frames `ava` already publishes on its internal bus | `ava` (robot) |
+| cleaning / moving  | **B:** a tiny `LD_PRELOAD` tap inside `ava` copies the frames `ava` already captures | `ava` (robot) |
 
-Because during cleaning we **don't open the camera a second time** — we passively read the frames
-`ava` is already producing for its AI node — there is **no conflict and no reboot**.
+Because during cleaning we **don't open the camera a second time** — we tap the frames `ava` is
+already producing for its AI node (by interposing `sunxi_cam::SunxiCam::GetImageFrame` inside `ava`) —
+there is **no conflict and no reboot**.
 
 ---
 
@@ -41,11 +42,11 @@ Because during cleaning we **don't open the camera a second time** — we passiv
 | Phase | What it does | State |
 |-------|--------------|-------|
 | **Phase 1** — supervisor + Source A | Safe base viewing. Auto‑starts `video_monitor` on the dock, **auto‑kills it before cleaning** so the robot never reboots. | ✅ **Working** (`make` targets below) |
-| **Phase 2** — Source B (cleaning) | Passive subscriber to `ava`'s `ava_ai_camera_msg` on the IPC bus → H264 → go2rtc. | 🚧 **Framework + RE done, encoder/decode `TODO`** — see [`phase2-cleaning/README.md`](phase2-cleaning/README.md) |
+| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ✅ **Implemented & builds for aarch64**; opt‑in (restarts `ava`). H264 param tuning to confirm on‑device — see [`phase2-cleaning/README.md`](phase2-cleaning/README.md) |
 
-With Phase 1 alone you get a **safe, automatic** stream that you can watch from the dock and that
-gets out of the way during cleaning. Phase 2 fills the "during cleaning" gap; the protocol is
-documented and the subscriber is scaffolded, but the NV21→H264 encode step still needs finishing.
+With Phase 1 alone you get a **safe, automatic** stream from the dock that gets out of the way during
+cleaning. Phase 2 adds live viewing **during** cleaning by tapping the frames `ava` already captures —
+fully reverse‑engineered and built; enabling it injects a tap into `ava` (opt‑in, restarts `ava`).
 
 ---
 
@@ -54,7 +55,7 @@ documented and the subscriber is scaffolded, but the NV21→H264 encode step sti
 **On your workstation** (to build & deploy):
 
 - `make`, `bash`, `ssh`, `tar`, `curl`
-- `clang` + `gcc-aarch64-linux-gnu` (cross toolchain for Phase 2) — only needed for `make build-phase2`
+- `docker` (preferred) **or** `gcc-aarch64-linux-gnu` + `libc6-dev-arm64-cross` — only for Phase 2 (`make build-phase2`)
 - A checkout of [tihmstar/vacuumstreamer](https://github.com/tihmstar/vacuumstreamer) **already built**
   (provides Source A: `video_monitor`, `vacuumstreamer.so`, and the `dist/ava/conf/video_monitor` configs).
   Point `VACUUMSTREAMER_DIR` at it in `config.mk`.
@@ -112,9 +113,9 @@ See [`docs/INSTALL.md`](docs/INSTALL.md) for a step‑by‑step walkthrough and
                         │
    ┌────────────────────┴─────────────────────┐
    │ Source A                                  │ Source B  (Phase 2)
-   │ video_monitor (opens /dev/video0)         │ ava_cam_relay (subscribes to
-   │  + vacuumstreamer.so  ── H264 ──▶ :6969   │  ipc:///tmp/avamsg.socket,
-   │  (killed before cleaning starts)          │  ava_ai_camera_msg) ─ H264 ─▶ :6969
+   │ video_monitor (opens /dev/video0)         │ libcamtap.so tap inside ava
+   │  + vacuumstreamer.so  ── H264 ──▶ :6969   │  (SunxiCam::GetImageFrame) ─NV21─▶
+   │  (killed before cleaning starts)          │  ava_cam_relay ── H264 ──▶ :6969
    └────────────────────┬─────────────────────┘
                         ▼
                     go2rtc  ──▶  RTSP :8554 / WebRTC :8555 / Web :1984

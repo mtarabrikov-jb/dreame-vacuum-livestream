@@ -1,42 +1,37 @@
-# Cross-compile the Phase 2 IPC relay to aarch64 for the robot.
+# Build the Phase 2 aarch64 artifacts for the robot:
+#   libcamtap.so    - LD_PRELOAD tap injected into ava (captures NV21 frames)
+#   ava_cam_relay   - out-of-ava process: shm -> H264 (CedarX) -> :6969
 #
-# Toolchain (same as tihmstar/vacuumstreamer's Dockerfile):
-#   apt install clang gcc-aarch64-linux-gnu
-# clang uses its built-in aarch64 target; gcc-aarch64-linux-gnu supplies the
-# sysroot headers + crt objects. No aarch64 gcc invocation is needed.
-#
-# We LINK against the robot's own libnanomsg.so.5 (fetched by `make pull-libs`)
-# instead of dlopen'ing it. That keeps the binary free of any glibc symbol newer
-# than the robot's 2.23 (notably dlopen@GLIBC_2.34 on modern build hosts) and
-# bakes the correct DT_NEEDED (libnanomsg.so.5) for runtime.
+# Toolchain: the aarch64 cross gcc (apt: gcc-aarch64-linux-gnu). Build inside the
+# pinned Docker image (`make docker`) for a reproducible result and to avoid
+# host-glibc symbol skew: dlopen/dlsym must resolve to <= GLIBC_2.23, which
+# debian:bullseye's cross glibc (2.31) satisfies. A newer base would emit
+# dlopen@GLIBC_2.34 and fail on the robot.
 
-TARGET     := aarch64-linux-gnu
-CC         := clang
-CFLAGS     := --target=$(TARGET) -O2 -Wall -Wextra
-ROBOT      ?= root@ROBOT-IP-NOT-SET
-ROBOT_LIBS := robot-libs
-NANOMSG    := $(ROBOT_LIBS)/libnanomsg.so.5
-BIN        := ava_cam_relay
+CC      := aarch64-linux-gnu-gcc
+CFLAGS  := -O2 -Wall -Wextra
+SHIM    := libcamtap.so
+RELAY   := ava_cam_relay
 
-.PHONY: all clean pull-libs
+.PHONY: all docker clean
+all: $(SHIM) $(RELAY)
 
-all: $(BIN)
+$(SHIM): src/libcamtap.c src/camtap_shm.h
+	$(CC) $(CFLAGS) -fPIC -shared src/libcamtap.c -o $@ -ldl
+	@echo ">> built $(SHIM) (aarch64 LD_PRELOAD tap)"
 
-$(BIN): src/ava_cam_relay.c $(NANOMSG)
-	$(CC) $(CFLAGS) src/ava_cam_relay.c $(NANOMSG) -o $(BIN)
-	@echo ">> built $(BIN) (aarch64). It is a SCAFFOLD — see phase2-cleaning/README.md"
+$(RELAY): src/ava_cam_relay.c src/camtap_shm.h src/vencoder.h
+	$(CC) $(CFLAGS) src/ava_cam_relay.c -o $@ -ldl
+	@echo ">> built $(RELAY) (aarch64 encoder/relay)"
 
-# Fetch the robot's libnanomsg so the linker has the exact soname + symbols.
-# Uses ssh+cat because the robot's BusyBox sshd has no sftp-server.
-$(NANOMSG):
-	@$(MAKE) pull-libs
-
-pull-libs:
-	@mkdir -p $(ROBOT_LIBS)
-	@echo ">> pulling libnanomsg.so.5 from $(ROBOT)"
-	@ssh $(ROBOT) 'cat "$$(find /usr/lib /lib -name libnanomsg.so.5 2>/dev/null | head -1)"' > $(NANOMSG)
-	@test -s $(NANOMSG) || { echo "ERROR: could not fetch libnanomsg.so.5 (is ROBOT reachable?)"; rm -f $(NANOMSG); exit 1; }
-	@echo ">> saved $(NANOMSG)"
+# Reproducible build with no host toolchain required (needs docker).
+docker:
+	docker build -t dreame-camstream-build .
+	docker create --name dcs_tmp dreame-camstream-build >/dev/null
+	docker cp dcs_tmp:/out/$(SHIM)  ./$(SHIM)
+	docker cp dcs_tmp:/out/$(RELAY) ./$(RELAY)
+	docker rm dcs_tmp >/dev/null
+	@echo ">> docker build produced $(SHIM) + $(RELAY)"
 
 clean:
-	rm -f $(BIN)
+	rm -f $(SHIM) $(RELAY)

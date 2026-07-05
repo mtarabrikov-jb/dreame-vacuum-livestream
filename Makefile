@@ -48,12 +48,13 @@ $(BUILD)/go2rtc:
 	curl -fL "$(GO2RTC_URL)" -o $@ && chmod +x $@
 
 .PHONY: build-phase2
-build-phase2: ## Cross-compile the optional Phase 2 IPC relay (best-effort)
-	@if command -v clang >/dev/null 2>&1; then \
-		$(MAKE) -C phase2-cleaning ROBOT="$(ROBOT)" all || \
-		  echo ">> Phase 2 build skipped (optional). Needs 'apt install gcc-aarch64-linux-gnu' + a reachable ROBOT for 'make -C phase2-cleaning pull-libs'. Phase 1 works without it."; \
+build-phase2: ## Cross-compile the optional Phase 2 tap+relay (Docker preferred)
+	@if command -v docker >/dev/null 2>&1; then \
+		$(MAKE) -C phase2-cleaning docker || echo ">> Phase 2 docker build failed (optional). Phase 1 works without it."; \
+	elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+		$(MAKE) -C phase2-cleaning all || echo ">> Phase 2 build failed (optional)."; \
 	else \
-		echo ">> clang not found — skipping Phase 2 (optional). 'apt install clang gcc-aarch64-linux-gnu'. Phase 1 works without it."; \
+		echo ">> no docker / aarch64 gcc — skipping Phase 2 (optional). Phase 1 works without it."; \
 	fi
 
 # Assemble everything that gets shipped to the robot.
@@ -70,9 +71,11 @@ stage: check-vacuumstreamer build-go2rtc
 	# our scripts + go2rtc config
 	cp phase1-base/*.sh $(STAGE)/
 	cp phase1-base/go2rtc.yaml $(STAGE)/
-	# Phase 2 binary if it was built
+	cp phase2-cleaning/inject-ava.sh $(STAGE)/
+	# Phase 2 artifacts if they were built (tap + relay)
 	@[ -f phase2-cleaning/ava_cam_relay ] && cp phase2-cleaning/ava_cam_relay $(STAGE)/ || \
-		echo ">> (no Phase 2 binary — Source B disabled; Phase 1 still fully functional)"
+		echo ">> (no ava_cam_relay — Source B disabled; Phase 1 still fully functional)"
+	@[ -f phase2-cleaning/libcamtap.so ] && cp phase2-cleaning/libcamtap.so $(STAGE)/ || true
 	chmod +x $(STAGE)/*.sh $(STAGE)/video_monitor $(STAGE)/go2rtc 2>/dev/null || true
 
 .PHONY: check-vacuumstreamer
@@ -96,6 +99,20 @@ install: ## One-time robot setup: config overlay + persistence in _root_postboot
 .PHONY: uninstall
 uninstall: ## Remove from robot: stop, unmount, strip the postboot block
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/install.sh uninstall' || true
+
+# ---- Phase 2 (streaming during cleaning) — OPT-IN, restarts ava ------------
+.PHONY: install-phase2
+install-phase2: ## OPT-IN: inject the camera tap into ava (RESTARTS ava). Enables Source B.
+	@echo ">> This restarts ava (navigation). Robot should be idle on the dock."
+	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh install'
+
+.PHONY: uninstall-phase2
+uninstall-phase2: ## Remove the ava tap and restart stock ava
+	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh remove' || true
+
+.PHONY: phase2-status
+phase2-status: ## Show whether the in-ava tap is active
+	@$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh status'
 
 # ---------------------------------------------------------------------------
 .PHONY: start

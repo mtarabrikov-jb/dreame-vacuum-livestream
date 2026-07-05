@@ -4,7 +4,7 @@ config.mk
 # local build output
 build/
 phase2-cleaning/ava_cam_relay
-phase2-cleaning/robot-libs/
+phase2-cleaning/libcamtap.so
 
 # proprietary / device-specific artifacts must never be committed
 video_monitor

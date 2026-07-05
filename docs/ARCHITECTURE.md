@@ -26,11 +26,11 @@ switch.
  │                                  │                                     │
  │            ┌──────── docked ─────┴───── cleaning/moving ───────┐       │
  │            ▼                                                    ▼       │
- │   Source A: video_monitor                        Source B: ava_cam_relay
- │   + vacuumstreamer.so (LD_PRELOAD)               (Phase 2, passive)     │
- │   opens /dev/video0                              subscribes to         │
- │   Agora hook diverts H264 ──┐                    ipc:///tmp/avamsg.socket
- │                             │                    NV21 ─► H264 ──┐       │
+ │   Source A: video_monitor                        Source B: libcamtap + ava_cam_relay
+ │   + vacuumstreamer.so (LD_PRELOAD)               (Phase 2, in-ava tap)  │
+ │   opens /dev/video0                              LD_PRELOAD in ava taps │
+ │   Agora hook diverts H264 ──┐                    SunxiCam::GetImageFrame │
+ │                             │                    NV21─►shm─►H264 ──┐    │
  │                             ▼                                   ▼       │
  │                       127.0.0.1:6969  ◄────────────────────────┘       │
  │                             │  (single H264 producer socket)           │
@@ -47,8 +47,11 @@ switch.
 - **Source A (`video_monitor` + `vacuumstreamer.so`)** — from
   [tihmstar/vacuumstreamer](https://github.com/tihmstar/vacuumstreamer). Opens the camera directly and
   the LD_PRELOAD shim reroutes the Agora H264 buffer to TCP `:6969`. Used **only on the dock**.
-- **Source B (`ava_cam_relay`, Phase 2)** — subscribes to the internal bus and re-encodes the frames
-  `ava` already produces. Used **when off the dock**. No second camera open ⇒ no reboot.
+- **Source B (`libcamtap.so` + `ava_cam_relay`, Phase 2)** — a tiny LD_PRELOAD tap inside `ava`
+  interposes `sunxi_cam::SunxiCam::GetImageFrame` and copies each NV21 frame to a tmpfs seqlock
+  buffer; a separate process encodes it to H264 (CedarX) and serves `:6969`. Used **when off the
+  dock**. No second camera open ⇒ no reboot. Opt-in (restarts `ava`). See
+  [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#5-how-phase-2-taps-camera-frames-verified).
 - **go2rtc** — single consumer of `:6969`, single point of external access. Stays up across switches.
 
 ## The switch (state → source)

@@ -1,70 +1,83 @@
 # Phase 2 — streaming during cleaning (Source B)
 
-**Status: scaffold + reverse-engineering done; two steps left to make it produce video.**
+**Status: fully reverse-engineered and implemented; deployable. The one part to confirm on real
+hardware is the CedarX H264 parameter tuning (frame tap + NV21 layout are verified).**
 
-Phase 1 gives you a safe stream from the dock and gets out of the camera's way during cleaning.
-Phase 2 fills that gap **without a second camera open** (which reboots the W10), by tapping the
-frames `ava` already publishes internally.
+Phase 1 streams from the dock and gets out of the camera's way during cleaning. Phase 2 fills the gap
+**without a second camera open** (which reboots the W10), by tapping the frames `ava` already captures.
 
-## The approach
+## How it actually works (the first design was wrong — see below)
 
-During cleaning, `ava`'s `camera_streamer` publishes NV21 frames to its AI-navigation node over a
-nanomsg bus at `ipc:///tmp/avamsg.socket`. `ava_cam_relay`:
+`ava` is monolithic and delivers camera frames in-process; there is **no external bus** to subscribe
+to (`ipc:///tmp/avamsg.socket` is never bound). So we tap frames **inside** `ava`:
 
-1. connects to that bus (as a passive subscriber — **does not touch `/dev/video*`**),
-2. filters the AI-camera message,
-3. extracts the NV21 frame,
-4. encodes it to H264 with the SoC's hardware encoder (CedarX `libvencoder.so`),
-5. serves H264 on `127.0.0.1:6969` — the **same** socket Source A uses, so the supervisor swaps
-   A↔B transparently and go2rtc never notices.
-
-## What already works in `src/ava_cam_relay.c`
-
-- Runtime `dlopen` of the robot's `libnanomsg.so.5` — so it cross-compiles with only `clang`.
-- Bus connect + receive loop, CRC16-Modbus framing helper.
-- A complete TCP server on `:6969` for go2rtc.
-- `--dump` mode: prints length + first bytes + type of the first 40 bus messages, so you can
-  **verify the subscription on-device** and identify the camera message.
-
-Run it on the robot **while it is cleaning**:
-
-```sh
-/data/camstream/ava_cam_relay --dump
+```
+ava + libcamtap.so ──NV21──▶ /tmp/camtap.shm ──▶ ava_cam_relay ──H264──▶ :6969 ──▶ go2rtc
+   (LD_PRELOAD tap)          (tmpfs seqlock)      (CedarX encoder)
 ```
 
-If you see a steady ~15 fps of large messages appear when cleaning starts, the tap works.
+1. **`libcamtap.so`** is `LD_PRELOAD`'d into `ava`. `node_camera_streamer` calls, across the `.so`
+   boundary, `sunxi_cam::SunxiCam::GetImageFrame(ImageFrame*)` in `libsunxicamera.so` — so we can
+   interpose it. On each frame we read the NV21 pointer at `ImageFrame+0x20` (size `w*h*3/2`, dims from
+   the `OpenCamera` hook) and `memcpy` it into a tmpfs seqlock buffer. Minimal and defensive: a bug
+   here can't stall navigation, and the heavy work is out-of-process.
+2. **`ava_cam_relay`** (separate process) reads the buffer, encodes NV21→H264 with the SoC hardware
+   encoder (`libvencoder.so`, CedarX), and serves H264 on `127.0.0.1:6969` — the **same** socket
+   Source A uses, so the supervisor swaps A↔B transparently.
 
-## The three TODOs (marked `[TODO-1/2/3]` in the source)
+Full derivation (disassembly, struct offsets, why the bus doesn't work) is in
+[`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md).
 
-1. **`MSGTYPE_AVA_AI_CAMERA`** — the numeric `getMsgType` id of the AI camera message. Find it by
-   correlating `--dump` output with cleaning start (the big, high-rate messages).
-2. **`struct ava_cam_hdr`** — the exact byte offsets of width / height / stride / format / timestamp
-   inside the payload, and where the NV21 bytes begin. NV21 total = `W*H*3/2`.
-3. **`nv21_to_h264()`** — wire up CedarX `libvencoder.so` (`VideoEncCreate` / `VideoEncInit` with
-   `nInputYuvFmt = VENC_PIXEL_YVU420SP` / `VideoEncodeOneFrame` / `GetOneBitstreamFrame`). Known-good
-   params from `vacuumstreamer`'s `recorder.cfg`: `864x480 @15fps YVU420SP`.
+## Files
 
-See [`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md) for the bus format, message
-wrapping (raknetmessage + CRC16), and camera topology that back these TODOs.
+- `src/libcamtap.c` — the in-ava tap (exports the two mangled `sunxi_cam::SunxiCam::*` hook symbols).
+- `src/ava_cam_relay.c` — shm reader + CedarX H264 encoder + `:6969` server. `--stats` mode just
+  reports the tap (fps/size) with no encoder — run it first to prove frames flow.
+- `src/camtap_shm.h` — the seqlock buffer format shared by both.
+- `src/vencoder.h` — the CedarX `VideoEnc*` API + struct layouts we call.
+- `inject-ava.sh` — opt-in install/remove of the tap (bind-mount wrapper over `/usr/bin/ava`).
 
 ## Build
 
-Toolchain (same as vacuumstreamer's Dockerfile):
+Reproducible, no host toolchain needed:
 
 ```sh
-apt install clang gcc-aarch64-linux-gnu        # clang target + aarch64 sysroot/crt
+make docker      # builds libcamtap.so + ava_cam_relay for aarch64 in a pinned container
 ```
 
-Then, from `phase2-cleaning/` (or `make build-phase2` at the repo root):
+Or with a local cross toolchain (`apt install gcc-aarch64-linux-gnu libc6-dev-arm64-cross`):
 
 ```sh
-make pull-libs   # fetch the robot's libnanomsg.so.5 (needs ROBOT reachable)
-make             # cross-compile ava_cam_relay for aarch64
+make             # aarch64-linux-gnu-gcc
 ```
 
-`pull-libs` copies the robot's own `libnanomsg.so.5` so we link against it directly (no `dlopen`,
-and no glibc symbol newer than the robot's 2.23). Output `ava_cam_relay` is picked up automatically
-by the root `make stage`/`upload`, and once present on the robot the supervisor uses it as Source B.
+The build is pinned to debian:bullseye on purpose: its cross glibc keeps `dlopen` at `GLIBC_2.17`, so
+the binaries run on the robot's glibc 2.23 (a newer base emits `dlopen@GLIBC_2.34` and fails).
 
-> Phase 2 is optional: if the toolchain or robot isn't available, the root `make build` just skips it
-> and Phase 1 still works fully.
+## Deploy (OPT-IN — restarts ava)
+
+From the repo root, after `make build && make upload`:
+
+```sh
+make install-phase2    # bind-mount the tap wrapper over /usr/bin/ava and RESTART ava
+make phase2-status     # check the tap is loaded in ava
+```
+
+> This restarts `ava`, the robot's navigation process. Do it with the robot idle on the dock. If
+> anything is wrong, `make uninstall-phase2` (or `inject-ava.sh remove` over SSH) restores stock ava.
+
+Then start a cleaning job and, on the robot, verify frames are flowing:
+
+```sh
+/data/camstream/ava_cam_relay --stats     # should print "<w>x<h> <bytes>, N frames total"
+```
+
+Once `--stats` shows frames, the supervisor uses `ava_cam_relay` as Source B automatically while
+cleaning.
+
+## The remaining unknown
+
+The frame tap and NV21 layout are verified by disassembly. The CedarX H264 **parameter indices**
+(bitrate/framerate/GOP in `VideoEncSetParameter`) are the standard Allwinner enum values but weren't
+confirmed against this exact BSP — if the H264 output is malformed, that's the first place to look
+(`src/vencoder.h`). `--stats` mode isolates the tap from the encoder so you can bisect quickly.
