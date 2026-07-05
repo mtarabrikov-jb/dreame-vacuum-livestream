@@ -40,7 +40,10 @@ struct camtap_shm {
 	volatile uint64_t dqbuf[4]; // 80,88,96,104  VIDIOC_DQBUF count per /dev/videoN
 	volatile uint32_t dqbytes[4]; // 112,116,120,124  last bytesused per /dev/videoN
 	uint8_t  vfmt[4][64];       // 128  raw v4l2_format bytes from S_FMT per /dev/videoN
-	uint8_t  data[CAMTAP_MAX_FRAME]; // 384
+	volatile uint64_t streamer; // 384  found AvaNodeCameraStreamer 'this' (0 = not found)
+	volatile uint32_t sw_before;// 392  value of streamer+0xa4 before we set it
+	volatile uint32_t sw_hits;  // 396  times we wrote the AI-camera switch = 3
+	uint8_t  data[CAMTAP_MAX_FRAME]; // 400
 };
 
 #endif

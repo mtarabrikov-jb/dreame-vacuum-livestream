@@ -172,8 +172,53 @@ int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
 // no context allocated yet (self[0]==NULL) and not already streaming (state!=3),
 // and rate-limited. This avoids the double-calloc / state corruption that a
 // blind start() would cause.
+// Find the single AvaNodeCameraStreamer instance in ava's heap by its vtable
+// pointer (object[0] == vtable_symbol + 16). Cached after the first success.
+static void *find_streamer(void) {
+	static void *cached = (void *)-1;
+	if (cached != (void *)-1) return cached;
+	cached = NULL;
+	void *h = dlopen("/ava/lib/node_camera_streamer.so", RTLD_NOLOAD | RTLD_NOW);
+	if (!h) h = dlopen("node_camera_streamer.so", RTLD_NOLOAD | RTLD_NOW);
+	void *vt = h ? dlsym(h, "_ZTVN21avanodecamerastreamer21AvaNodeCameraStreamerE") : NULL;
+	if (!vt) return NULL;
+	uintptr_t want = (uintptr_t)vt + 16;   // vtable pointer stored in an object
+	FILE *f = fopen("/proc/self/maps", "r");
+	if (!f) return NULL;
+	char line[300];
+	unsigned long scanned = 0;
+	while (fgets(line, sizeof line, f)) {
+		uintptr_t lo, hi; char perms[8];
+		if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+		if (perms[0] != 'r' || perms[1] != 'w') continue;          // rw only
+		if (strstr(line, "[stack]")) continue;                     // not on the stack
+		if (hi - lo > 512ul * 1024 * 1024) continue;               // skip huge maps
+		for (uintptr_t p = lo; p + sizeof(uintptr_t) <= hi; p += sizeof(uintptr_t)) {
+			if (*(volatile uintptr_t *)p == want) { cached = (void *)p; fclose(f); return cached; }
+		}
+		scanned += (hi - lo);
+		if (scanned > 512ul * 1024 * 1024) break;                  // safety cap
+	}
+	fclose(f);
+	return cached;
+}
+
+// Force level 3: set the AI-camera switch (streamer+0xa4 = 3) so camera_streamer
+// runs its own proper enable path (media-ctl links / ISP config) — the thing a
+// raw SunxiCam::start() can't reproduce.
+static void force_ai_switch(void) {
+	void *st = find_streamer();
+	if (g_shm) g_shm->streamer = (uint64_t)(uintptr_t)st;
+	if (!st) return;
+	volatile int *sw = (volatile int *)((char *)st + 0xa4);
+	if (g_shm && g_shm->sw_hits == 0) g_shm->sw_before = (uint32_t)*sw;
+	*sw = 3;
+	if (g_shm) g_shm->sw_hits++;
+}
+
 typedef int (*shutdown_fn)(void*);
 static void maybe_force_start(void *self) {
+	if (g_force == 3) { force_ai_switch(); return; }
 	static start_fn real_start = NULL;
 	static shutdown_fn real_shutdown = NULL;
 	if (!g_force || !self) return;
