@@ -1,0 +1,20 @@
+# per-user config (contains your robot's IP) — never commit
+config.mk
+
+# local build output
+build/
+phase2-cleaning/ava_cam_relay
+phase2-cleaning/robot-libs/
+
+# proprietary / device-specific artifacts must never be committed
+video_monitor
+vacuumstreamer.so
+go2rtc
+*.bin
+mnt_private_ovl/
+ava_conf_ovl/
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store

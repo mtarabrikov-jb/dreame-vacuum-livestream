@@ -1,0 +1,22 @@
+# Per-user configuration for dreame-vacuum-livestream.
+#
+#   cp config.mk.example config.mk   &&   $EDITOR config.mk
+#
+# config.mk is git-ignored so your robot's IP never lands in the repo.
+
+# SSH target of your rooted robot. user@host — usually root.
+ROBOT ?= root@10.0.0.123
+
+# Where everything is installed on the robot. Must live under /data (the only
+# writable, persistent filesystem; the rootfs is read-only squashfs).
+REMOTE_DIR ?= /data/camstream
+
+# go2rtc release to download for arm64. See https://github.com/AlexxIT/go2rtc/releases
+GO2RTC_VERSION ?= v1.9.9
+
+# Path to your ALREADY-BUILT tihmstar/vacuumstreamer checkout. It must contain:
+#   dist/usr/bin/video_monitor      (proprietary Dreame binary you extracted)
+#   vacuumstreamer.so               (the Agora LD_PRELOAD hook, from `make`)
+#   dist/ava/conf/video_monitor/    (recorder.cfg, cedarx.conf, … )
+# We copy Source A from here; we never redistribute video_monitor ourselves.
+VACUUMSTREAMER_DIR ?= ../vacuumstreamer
