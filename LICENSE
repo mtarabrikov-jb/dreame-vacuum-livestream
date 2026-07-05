@@ -23,7 +23,5 @@ SOFTWARE.
 ---
 
 NOTE: This license covers ONLY the original glue code, scripts, and
-documentation in this repository. It does NOT cover the proprietary Dreame
-`video_monitor` binary (which you must extract from your own device via
-tihmstar/vacuumstreamer), nor go2rtc, nanomsg, or any other third-party
-component, each of which is governed by its own license.
+documentation in this repository. It does NOT cover go2rtc or any other
+third-party component, each of which is governed by its own license.

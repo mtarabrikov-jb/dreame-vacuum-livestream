@@ -11,12 +11,6 @@ ROBOT ?= root@10.0.0.123
 # writable, persistent filesystem; the rootfs is read-only squashfs).
 REMOTE_DIR ?= /data/camstream
 
-# go2rtc release to download for arm64. See https://github.com/AlexxIT/go2rtc/releases
+# go2rtc release to download for arm64 (only if the robot doesn't already have
+# one at /data/vacuumstreamer/go2rtc). See https://github.com/AlexxIT/go2rtc/releases
 GO2RTC_VERSION ?= v1.9.9
-
-# Path to your ALREADY-BUILT tihmstar/vacuumstreamer checkout. It must contain:
-#   dist/usr/bin/video_monitor      (proprietary Dreame binary you extracted)
-#   vacuumstreamer.so               (the Agora LD_PRELOAD hook, from `make`)
-#   dist/ava/conf/video_monitor/    (recorder.cfg, cedarx.conf, … )
-# We copy Source A from here; we never redistribute video_monitor ourselves.
-VACUUMSTREAMER_DIR ?= ../vacuumstreamer

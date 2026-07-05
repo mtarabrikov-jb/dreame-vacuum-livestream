@@ -2,104 +2,106 @@
 
 ## Goal
 
-One camera feed from a rooted Dreame W10, viewable **on the dock** and **during cleaning**, exposed
-as RTSP/WebRTC via go2rtc, that never destabilizes the robot.
+One camera feed from a rooted Dreame W10, served through the robot's own go2rtc as RTSP / WebRTC /
+MSE, whose content **auto-switches with the robot's state** and **never destabilizes navigation**:
 
-## The hard constraint
+- **on the dock** — full-color RGB (the room from floor level)
+- **while cleaning** — grayscale infrared (the ToF/obstacle sensor's view)
 
-The W10 has **one** physical camera (an `OV8856`). The robot needs it for AI obstacle avoidance while
-cleaning — `ava` opens it as `/dev/video2`. The stock streaming path (`video_monitor`) opens it as
-`/dev/video0`. Both map to the **same sensor**. When both are open at once during cleaning, the robot
-**reboots** (observed; see [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#the-camera-conflict)).
+## Why it's built this way
 
-So we cannot "just run `video_monitor` all the time". We need two mutually-exclusive sources and a
-switch.
+The W10 will not stream its RGB camera during cleaning — the firmware keeps the OV8856 idle then and
+uses the separate ToF sensor for obstacle avoidance (proven in
+[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#on-device-test-result-the-real-blocker-the-rgb-camera-does-not-stream-during-cleaning)).
+The vendor's `video_monitor` streamer can't help either: on a de-clouded (Valetudo) robot it idles
+forever waiting for an Agora "start" command that never arrives. So both feeds are produced from
+**inside `ava`** instead:
+
+- On the dock, `ava`'s own `camera_streamer` isn't using the RGB camera, so we drive it ourselves.
+- While cleaning, we passively tap the ToF frames `ava` is already capturing — no second camera open.
 
 ## Components
 
 ```
- ┌──────────────────────────────────────────────────────────────────────┐
- │ robot (rooted Dreame W10, /data is the only writable fs)              │
- │                                                                        │
- │  Valetudo REST  ◄─────poll──── supervisor.sh                          │
- │  :80 /api/v2                     │  decides A vs B from robot state    │
- │                                  │                                     │
- │            ┌──────── docked ─────┴───── cleaning/moving ───────┐       │
- │            ▼                                                    ▼       │
- │   Source A: video_monitor                        Source B: libcamtap + ava_cam_relay
- │   + vacuumstreamer.so (LD_PRELOAD)               (Phase 2, in-ava tap)  │
- │   opens /dev/video0                              LD_PRELOAD in ava taps │
- │   Agora hook diverts H264 ──┐                    SunxiCam::GetImageFrame │
- │                             │                    NV21─►shm─►H264 ──┐    │
- │                             ▼                                   ▼       │
- │                       127.0.0.1:6969  ◄────────────────────────┘       │
- │                             │  (single H264 producer socket)           │
- │                             ▼                                          │
- │                          go2rtc  ──► :8554 RTSP  :8555 WebRTC  :1984 web│
- └──────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼  LAN
-                    browser / VLC / Home Assistant
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ robot (rooted Dreame W10, /data is the only writable fs)                   │
+ │                                                                             │
+ │  ava (navigation brain, LD_PRELOAD = libcamtap.so)                         │
+ │   ├─ dock : drive thread owns SunxiCam (OpenCamera/GetImageFrame/Return)   │
+ │   │        → NV21 672x504 ─────────────┐                                   │
+ │   └─ clean: ioctl(VIDIOC_DQBUF) tap of /dev/video1 (ToF)                   │
+ │            → raw 224x1558 ─────────────┤                                   │
+ │        (one g_cam_lock mutex + ownership handoff = no clash with ava)      │
+ │                                        ▼                                    │
+ │                                 /tmp/camtap.shm  (tmpfs, seqlock)          │
+ │                                        │                                    │
+ │                                 ava_cam_relay  (separate process)          │
+ │                                   fmt 0  → color JPEG (NV21→YCbCr)         │
+ │                                   fmt 100→ IR JPEG (unstack+flatfield,     │
+ │                                            YCbCr neutral chroma, rot 180)  │
+ │                                        │ MJPEG                              │
+ │                                        ▼                                    │
+ │                                 127.0.0.1:8090  (loopback)                 │
+ │                                        │                                    │
+ │                                 go2rtc  ──► :8554 RTSP  :8555 WebRTC  :1984 │
+ └───────────────────────────────────────────────────────────────────────────┘
+                                          │  LAN
+                                          ▼
+                           browser / VLC / Home Assistant   (stream: camera)
 ```
 
-- **`supervisor.sh`** — the only always-on decision maker. Polls Valetudo `robot/state/attributes`
-  every few seconds, reads `StatusStateAttribute.value`, and keeps exactly one source alive.
-- **Source A (`video_monitor` + `vacuumstreamer.so`)** — from
-  [tihmstar/vacuumstreamer](https://github.com/tihmstar/vacuumstreamer). Opens the camera directly and
-  the LD_PRELOAD shim reroutes the Agora H264 buffer to TCP `:6969`. Used **only on the dock**.
-- **Source B (`libcamtap.so` + `ava_cam_relay`, Phase 2)** — a tiny LD_PRELOAD tap inside `ava`
-  interposes `sunxi_cam::SunxiCam::GetImageFrame` and copies each NV21 frame to a tmpfs seqlock
-  buffer; a separate process encodes it to H264 (CedarX) and serves `:6969`. Used **when off the
-  dock**. No second camera open ⇒ no reboot. Opt-in (restarts `ava`). See
-  [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#5-how-phase-2-taps-camera-frames-verified).
-- **go2rtc** — single consumer of `:6969`, single point of external access. Stays up across switches.
+- **`libcamtap.so`** — LD_PRELOAD'd into `ava`. Interposes the exported `sunxi_cam::SunxiCam` symbols
+  (`OpenCamera` / `GetImageFrame` / `CloseCamera`) and the libc `ioctl`. A background thread drives the
+  RGB camera on the dock; the `ioctl` hook copies ToF frames while cleaning. All writes go to the
+  tmpfs seqlock buffer `/tmp/camtap.shm`.
+- **`ava_cam_relay`** — out-of-process. Reads whichever frame is in the buffer, encodes it to JPEG
+  with a self-contained baseline encoder (color 4:2:0 for RGB; grayscale-as-YCbCr for IR), and serves
+  MJPEG on `127.0.0.1:8090`. Running outside `ava` means an encoder bug can't crash navigation.
+- **go2rtc** — the robot's existing `/data/vacuumstreamer/go2rtc`. Consumes the loopback MJPEG as the
+  single stream `camera` and re-serves RTSP / WebRTC / MSE / snapshots. One URL throughout.
 
-## The switch (state → source)
+## The switch (who owns the camera)
 
-`supervisor.sh` maps Valetudo state to a source:
+There is no external supervisor — the switch is intrinsic:
 
-| Valetudo `StatusStateAttribute.value` | Source | Camera opened by |
-|---------------------------------------|--------|------------------|
-| `docked`                              | **A**  | video_monitor    |
-| `cleaning`, `returning`, `moving`, `paused`, `idle`, `error`, `manual_control` | **B** (or none if relay absent) | ava only |
-| (API unreachable)                     | hold current — don't thrash | — |
+- The **relay auto-picks** by the shm frame's `format` field: `0` = NV21 (color RGB), `100` = raw ToF
+  (infrared). Whatever the shim last wrote is what go2rtc serves.
+- The **shim's drive thread yields** the RGB camera the instant `ava` needs it. `cs_busy()` is true
+  when `camera_streamer`'s hooks fired recently **or** the ToF stream is live (cleaning) — in either
+  case the drive thread closes the RGB camera and stops. When the robot re-docks and `ava` goes quiet,
+  it re-acquires and RGB resumes.
 
-Only `docked` is treated as camera-safe for Source A, because in every other state the robot may be
-off the dock with `ava` about to (or already) using the camera. On each transition the supervisor
-stops the old source, waits ~1s for the device to be released, then starts the new one.
+## Crash-safety (the key invariant)
 
-Without Phase 2 installed, "Source B" is simply "no stream" — the feed pauses while cleaning and
-resumes automatically on docking. That is the safe default.
+`ava`'s `camera_streamer` and our drive thread use the **same** `SunxiCam` object. Letting both own its
+lifecycle deadlocked `ava` (the robot hung mid-clean). The fix, in `libcamtap.c`:
 
-## Why go2rtc always sees one socket
+- **One mutex `g_cam_lock`** wraps *every* real `SunxiCam` call — from the drive thread and from
+  `ava`, whose `OpenCamera`/`GetImageFrame`/`CloseCamera` all pass through our interposed hooks. No two
+  threads are ever inside a `SunxiCam` function at once.
+- **Explicit ownership** (`g_owner` = none / drive / streamer). When `ava` calls `OpenCamera`
+  (cleaning starting), the hook closes the drive thread's session under the lock and takes over;
+  `CloseCamera` returns ownership; the drive thread only acquires when `g_owner == none` and `ava` is
+  idle.
 
-Both sources publish raw H264 to `127.0.0.1:6969`, and go2rtc's only stream is `tcp://127.0.0.1:6969`.
-go2rtc reconnects on its own when the producer changes, so switching A↔B needs no go2rtc restart and
-no client-side URL change. Viewers keep the same `rtsp://…:8554/camera` / web URL throughout.
+Result: `ava` stays up across dock→clean→dock transitions (verified over multiple cycles).
 
 ## On-disk layout on the robot (`/data/camstream`)
 
 ```
-video_monitor              Source A binary (proprietary, from vacuumstreamer)
-vacuumstreamer.so          Source A Agora hook
-ava_cam_relay              Source B binary (Phase 2, optional)
-go2rtc                     streaming server (arm64)
-go2rtc.yaml                go2rtc config (:6969 -> rtsp/webrtc/web)
-supervisor.sh              the switch (main loop + --stop/--status)
-run_vm.sh / run_go2rtc.sh  exec-launchers
-install.sh                 on-device setup/teardown
-ava_conf_video_monitor/    video_monitor's configs (from vacuumstreamer)
-ava_conf_ovl/              full copy of /ava/conf + video_monitor/ (bind-mounted over /ava/conf)
-mnt_private_ovl/           copy of this robot's /mnt/private (bind-mounted over /mnt/private)
+libcamtap.so     the in-ava tap/drive shim (LD_PRELOAD)
+ava_cam_relay    ToF/RGB frame -> JPEG -> MJPEG :8090
+go2rtc_ir.yaml   go2rtc config: consume :8090, serve stream "camera"
+run_ir.sh        start/stop the relay + go2rtc
+inject-ava.sh    inject/remove the shim (bind-mount wrapper over /usr/bin/ava), + boot persistence
+camtap.env       CAMTAP_FORCE=5 (RGB drive) + CAMTAP_IR=1 (ToF tap)
+ava_real/ava     snapshot of the stock ava the wrapper exec's with LD_PRELOAD
 ```
 
-The two `*_ovl` dirs exist because `video_monitor.cfg` hardcodes `/ava/conf/video_monitor/...` and
-`/ava` is a read-only squashfs. They are assembled on-device by `install.sh` from the robot's own
-files, so nothing device-specific ever lives in the repo. See
-[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#the-config-overlay).
+## Injection & persistence
 
-## Persistence
-
-`install.sh` appends a marked block to `/data/_root_postboot.sh` (the root boot hook invoked from
-`/etc/rc.sysinit`) that relaunches `supervisor.sh` after every reboot. `make uninstall` removes the
-block by marker. It never rewrites the rest of `_root_postboot.sh` (which also launches Valetudo).
+`/etc` is a read-only squashfs with no `/etc/ld.so.preload`, so `inject-ava.sh` bind-mounts a tiny
+wrapper over `/usr/bin/ava` that sets `LD_PRELOAD=…/libcamtap.so` and `exec`s a copy of the real `ava`.
+It adds a marked block to `/data/_root_postboot.sh` (the root boot hook) that re-applies the bind mount
+and starts the feed after every reboot. `make uninstall` removes the block and restores stock
+`ava`. Injecting **restarts `ava`** — do it with the robot idle on the dock.

@@ -6,6 +6,19 @@ product code, and struct layouts. Treat model-specific numbers as W10-only unles
 
 Placeholders: `<robot-ip>` = your robot's LAN address; `root@<robot-ip>` = its SSH login.
 
+> **Outcome (read this first).** This is a *log* — it records several hypotheses that were tried and
+> discarded before the working solution, so individual sections below reach conclusions that a *later*
+> section overturns. The shipped result:
+> - **On the dock:** full-color RGB, by driving `ava`'s own RGB camera from a thread inside `ava`
+>   (`SunxiCam` OpenCamera → GetImageFrame + **ReturnImageFrame**), serialized with `ava` by a mutex.
+>   The RGB "black frame" scare was just a dark room.
+> - **While cleaning:** grayscale infrared, by passively tapping the ToF sensor (`/dev/video1`) that
+>   `ava` runs for obstacle avoidance. The RGB camera genuinely does **not** stream while cleaning
+>   (that part of the notes stands) — infrared is what's available then.
+> - **Encode/serve:** software baseline JPEG (color, and grayscale-as-YCbCr for IR) → MJPEG → the
+>   robot's go2rtc. The CedarX H264 path (sections below) was abandoned as too fragile.
+> See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the final design.
+
 ---
 
 ## 1. Platform
@@ -185,18 +198,19 @@ it streams the whole time it cleans.
    the frame was captured).
 2. Unstack the 173-row bands; take the sharpest sub-frame, or max-project several for more detail.
 3. Flat-field (subtract the per-column fixed-pattern stripes) + contrast-stretch to 8-bit grayscale.
-4. Encode the gray as H264 (CedarX, chroma=128) or MJPEG → `:6969` → go2rtc (RTSP/WebRTC, like Phase 1).
+4. Rotate 180° (the ToF sensor is mounted rotated), then encode → MJPEG → go2rtc.
 
-Only step 4 (encode) remains. Caveats: grayscale IR, ~224×173, ~8 fps — the RGB camera still cannot
-stream while cleaning (proven three ways above). But this is a genuine live view of the robot cleaning.
+**Resolution (this is what shipped).** This is a genuine live view of the robot cleaning — in
+**infrared**, not RGB. The watchable RGB camera *is* kept off during autonomous cleaning by the
+firmware (proven three ways above), so infrared is the only cleaning-time feed; that limit stands.
+What changed vs the pessimistic wording that used to be here:
+- The dock view **is** RGB after all — see the RGB-on-dock section below. RGB never streams *while
+  cleaning*, but on the dock we drive it ourselves.
+- The encoder is **software JPEG**, not CedarX H264. CedarX produced a valid IDR but wouldn't expose
+  SPS/PPS and corrupted its own context after one frame — too fragile. A self-contained baseline JPEG
+  encoder (color for RGB, grayscale-as-YCbCr for IR) → MJPEG → go2rtc is robust and fully controlled.
 
-**Final conclusion: you cannot watch a normal video of the cleaning on the W10.** The only thing that
-streams while cleaning is raw ToF/depth data (`video1`, not a picture); the watchable RGB camera
-(`video2`) is kept off during autonomous cleaning by the firmware (the OV8856 is the vendor's
-*remote-monitoring* camera, used when idle), and no software force got it to produce frames. Tapping
-`video1` is possible but yields raw depth sensor data, not a camera view. **Phase 1 (dock viewing) is
-the deliverable; Phase 2 is retained as a documented dead end.** The tap, ioctl instrumentation, and
-CedarX encoder are all correct and reusable — there is just no cleaning-time camera image to feed them.
+So the deliverable is a single go2rtc stream: RGB on the dock, infrared while cleaning.
 
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 
@@ -270,6 +284,37 @@ MCU telemetry is the ground truth, and code/behavior patches (we tried several o
 `libaether_route_nodes.so`) could not fix a hardware fault.
 
 ---
+
+## 9. RGB on the dock + crash-safety (the final working design)
+
+The pessimistic notes above are about RGB *during cleaning*. On the **dock** it does work:
+
+- **The camera works; darkness fooled us.** The first captured dock frame was near-black
+  (`Y mean ≈ 1`) — but that was a dark room. With a light on, the same tap gives a clean full-color
+  image (`Y` spans 2..254). So the RGB path is fine; it just needs light.
+- **`camera_streamer` is idle on the dock,** so we drive the camera ourselves from a thread in the
+  shim: `SunxiCam::OpenCamera` once, then loop `GetImageFrame` → publish → `ReturnImageFrame`. The
+  **`ReturnImageFrame` (qbuf) is the crux** — without re-queuing, the 3-buffer pool starves after ~3
+  frames (which is why earlier attempts saw only a brief burst). With it, it streams continuously at
+  ~14 fps. Setting the AI-camera switch (`this+0xa4=3`) alone does **not** start a stream.
+- **Crash-safety.** `ava`'s `camera_streamer` and our drive thread share the *same* `SunxiCam` object;
+  letting both manage its lifecycle deadlocked `ava` mid-clean (the robot "hangs"; `ava` is killed by
+  the watchdog — no segfault in `dmesg`). Fix: one mutex serializes every real `SunxiCam` call (ours +
+  `ava`'s, which all pass through our interposed `OpenCamera`/`GetImageFrame`/`CloseCamera` hooks), and
+  an explicit ownership handoff — when `ava` opens the camera (cleaning) the hook closes the drive
+  thread's session under the lock and takes over; the drive thread yields whenever `ava` is active
+  (recent hook calls) or the ToF stream is live. Verified stable across many dock↔clean cycles.
+
+## 10. go2rtc chokes on grayscale JPEG
+
+When the feed switches to the infrared (grayscale) image, go2rtc **panics and dies**:
+
+> `panic: interface conversion: image.Image is *image.Gray, not *image.YCbCr`
+> `github.com/AlexxIT/go2rtc/pkg/mjpeg.Transcode`
+
+Its MJPEG transcoder hard-casts decoded frames to `*image.YCbCr`. Fix: encode the IR frame as a
+3-component **YCbCr** JPEG with neutral chroma (`U=V=128`) — visually identical grayscale, but go2rtc
+is happy. Both feeds are therefore YCbCr JPEGs.
 
 ## Tooling used
 

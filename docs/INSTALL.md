@@ -3,10 +3,10 @@
 ## 0. Prerequisites
 
 - A **rooted** Dreame W10 (`r2104`) reachable over SSH: `ssh root@<robot-ip>` works.
-- On your workstation: `make`, `ssh`, `tar`, `curl`; `clang` only if you want to build Phase 2;
-  `ffmpeg` only if you want `make view`.
-- A **built** [tihmstar/vacuumstreamer](https://github.com/tihmstar/vacuumstreamer) checkout providing
-  `dist/usr/bin/video_monitor`, `vacuumstreamer.so`, and `dist/ava/conf/video_monitor/`.
+- On your workstation: `make`, `ssh`, `tar`, `curl`, and **`docker`** (used to cross-compile the two
+  aarch64 artifacts reproducibly; no host toolchain needed). `ffmpeg` only if you want `make view`.
+- The robot already has a `go2rtc` binary (from the dustbuilder/vacuumstreamer setup, at
+  `/data/vacuumstreamer/go2rtc`). If not, `make build` downloads one and it is uploaded too.
 
 > Why no `scp`: the robot's BusyBox `sshd` ships no `sftp-server`, so `scp -O` fails with
 > `/usr/libexec/sftp-server: not found`. Everything here uses `tar | ssh 'tar -x'` instead.
@@ -15,10 +15,11 @@
 
 ```sh
 cp config.mk.example config.mk
-$EDITOR config.mk
+$EDITOR config.mk          # set ROBOT=root@<robot-ip>
 ```
 
-Set at least `ROBOT=root@<robot-ip>` and `VACUUMSTREAMER_DIR=/path/to/your/vacuumstreamer`.
+`ROBOT` is the only value you must set. `REMOTE_DIR` (install path under `/data`) and `GO2RTC_VERSION`
+(only used if the robot has no `go2rtc` yet) have working defaults.
 
 ## 2. Build
 
@@ -26,8 +27,8 @@ Set at least `ROBOT=root@<robot-ip>` and `VACUUMSTREAMER_DIR=/path/to/your/vacuu
 make build
 ```
 
-Downloads `go2rtc` (arm64), cross-compiles Phase 2 if `clang` is present (skipped otherwise), and
-stages everything into `build/stage/`.
+Downloads `go2rtc` (arm64) and cross-compiles `libcamtap.so` + `ava_cam_relay` for aarch64 in a pinned
+Docker image, then stages everything into `build/stage/`.
 
 ## 3. Upload
 
@@ -35,54 +36,62 @@ stages everything into `build/stage/`.
 make upload
 ```
 
-Creates `$(REMOTE_DIR)` on the robot and streams the staged tree over `tar`+`ssh`.
+Creates `$(REMOTE_DIR)` (default `/data/camstream`) on the robot and streams the staged tree over
+`tar`+`ssh`.
 
-## 4. Install (on-device setup)
+## 4. Install — inject the shim (restarts ava)
 
 ```sh
 make install
 ```
 
-This runs `install.sh` on the robot: assembles the `/ava/conf` and `/mnt/private` overlays from the
-robot's own files, and adds a marked boot-hook block to `/data/_root_postboot.sh`.
+This runs `inject-ava.sh install` on the robot: it snapshots the stock `ava`, bind-mounts a wrapper
+over `/usr/bin/ava` that `LD_PRELOAD`s `libcamtap.so`, writes `camtap.env` (`CAMTAP_FORCE=5` +
+`CAMTAP_IR=1`), adds the boot-persistence block, **restarts `ava`**, and starts the feed (relay +
+go2rtc).
 
-## 5. Start
+> `ava` is the navigation brain — run this with the robot **idle on the dock**. If anything is wrong,
+> `make uninstall` (or `inject-ava.sh remove` over SSH) restores stock `ava`.
 
-```sh
-make start
-make status
-```
-
-`status` shows the robot state, which source is live, and the URLs. Since the robot is on the dock,
-you should see **Source A up** and go2rtc listening.
-
-Open **`http://<robot-ip>:1984`** (go2rtc web UI) or **`rtsp://<robot-ip>:8554/camera`** in VLC.
-`make view` grabs a single frame to `build/frame.jpg` to confirm the feed.
-
-## 6. Verify the cleaning behavior
-
-Start a cleaning job (app/Valetudo). Within a few seconds `make status` should flip to:
-`robot state: cleaning`, `source A: down`. With Phase 2 not yet finished, the stream pauses during
-cleaning and resumes automatically when the robot re-docks. The point: **the robot must not reboot**.
-If you built and installed a working Phase 2 `ava_cam_relay`, `status` shows `source B: UP` instead.
-
-## Teardown
+## 5. Watch
 
 ```sh
-make stop        # stop processes, keep files
-make uninstall   # stop + unmount overlays + remove the boot-hook block
+make watch          # prints the URLs
 ```
 
-Files stay in `$(REMOTE_DIR)`; `ssh root@<robot-ip> 'rm -rf /data/camstream'` removes them fully.
+- Web UI : `http://<robot-ip>:1984/`  (stream `camera`)
+- RTSP   : `rtsp://<robot-ip>:8554/camera`  (VLC → Open Network Stream)
+- WebRTC : `http://<robot-ip>:1984/webrtc.html?src=camera`
+- Snap   : `http://<robot-ip>:1984/api/frame.jpeg?src=camera`
+
+On the dock you get **color RGB**; start a cleaning and it auto-switches to **infrared**. `make view`
+grabs a single frame to `build/frame.jpg` to confirm.
+
+## Control & teardown
+
+```sh
+make start        # (re)start the relay + go2rtc
+make stop         # stop them
+make status       # is the shim active in ava?
+make uninstall    # remove the shim, restart stock ava
+```
 
 ## Troubleshooting
 
-- **`video_monitor is Running, Please Check`** — a leftover `video_monitor` process, or a launcher
-  whose argv contains `video_monitor`. `make stop` clears it; the shipped `run_vm.sh` uses `exec` to
-  avoid the false positive.
-- **go2rtc shows no stream** — check `make logs`. Source A needs `/tmp/videomonitor.socket` absent
-  (the launcher removes it) and the `/ava/conf` overlay mounted (`grep /ava/conf /proc/mounts` on the
-  robot).
-- **Robot rebooted** — a source opened the camera during cleaning. Confirm `supervisor.sh` is the one
-  starting sources (don't run `video_monitor` by hand) and that state polling reaches Valetudo
-  (`curl -s http://127.0.0.1/api/v2/robot/state/attributes` on the robot).
+- **Robot hangs during cleaning** — an old build where the drive thread raced `ava` over the camera.
+  The current shim serializes all `SunxiCam` access with a mutex; rebuild + redeploy `libcamtap.so`.
+- **go2rtc dies when cleaning starts** — an old relay that emitted a 1-component grayscale JPEG (go2rtc
+  panics on that). The current relay encodes IR as YCbCr; rebuild + redeploy `ava_cam_relay`.
+- **No RGB on the dock** — with the room dark the image is nearly black (it's a real camera, not IR);
+  turn a light on. Check `make status` shows the tap active.
+- **Blank feed while cleaning** — the ToF stream starts a few seconds after undocking; give it a moment.
+
+## History
+
+An earlier approach used the vendor `video_monitor` (via [tihmstar/vacuumstreamer]) for the dock RGB
+view and a `supervisor.sh` to switch sources. It was dropped: `video_monitor` idles forever on a
+de-clouded robot (it waits for a cloud "start" command it never gets), so the dock RGB now comes from
+the in-`ava` drive thread instead. Those scripts have been removed from the tree; the full
+investigation is in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
+
+[tihmstar/vacuumstreamer]: https://github.com/tihmstar/vacuumstreamer

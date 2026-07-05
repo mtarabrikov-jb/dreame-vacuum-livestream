@@ -1,6 +1,6 @@
 # dreame-vacuum-livestream — build / deploy / control
 #
-# All robot transfers use `ssh '… cat > file'` because the robot's BusyBox sshd
+# All robot transfers use `tar | ssh 'tar -x'` because the robot's BusyBox sshd
 # has no sftp-server (so `scp -O` fails). See README.
 #
 # Run `make help` for a description of every target.
@@ -11,18 +11,13 @@
 ROBOT              ?= root@ROBOT-IP-NOT-SET
 REMOTE_DIR         ?= /data/camstream
 GO2RTC_VERSION     ?= v1.9.9
-VACUUMSTREAMER_DIR ?= ../vacuumstreamer
 
 # ---- derived ---------------------------------------------------------------
 SSH        := ssh -o ConnectTimeout=12 $(ROBOT)
 GO2RTC_URL := https://github.com/AlexxIT/go2rtc/releases/download/$(GO2RTC_VERSION)/go2rtc_linux_arm64
 BUILD      := build
-STAGE      := $(BUILD)/stage          # mirrors what lands in $(REMOTE_DIR) on the robot
-
-# Files taken from your built vacuumstreamer checkout (Source A).
-VM_BIN     := $(VACUUMSTREAMER_DIR)/dist/usr/bin/video_monitor
-VM_SHIM    := $(VACUUMSTREAMER_DIR)/vacuumstreamer.so
-VM_CONF    := $(VACUUMSTREAMER_DIR)/dist/ava/conf/video_monitor
+# STAGE mirrors what lands in $(REMOTE_DIR) on the robot
+STAGE      := $(BUILD)/stage
 
 .DEFAULT_GOAL := help
 
@@ -33,11 +28,11 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| sort | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}'
 	@echo
-	@echo "Typical flow:  make build → make upload → make install → make start"
+	@echo "Typical flow:  make build → make upload → make install → make watch"
 
 # ---------------------------------------------------------------------------
 .PHONY: build
-build: build-go2rtc build-phase2 stage ## Build/fetch all local artifacts into build/stage
+build: build-go2rtc build-shim stage ## Build/fetch all local artifacts into build/stage
 	@echo ">> build complete → $(STAGE)"
 
 .PHONY: build-go2rtc
@@ -47,82 +42,61 @@ $(BUILD)/go2rtc:
 	@echo ">> downloading go2rtc $(GO2RTC_VERSION)"
 	curl -fL "$(GO2RTC_URL)" -o $@ && chmod +x $@
 
-.PHONY: build-phase2
-build-phase2: ## Cross-compile the optional Phase 2 tap+relay (Docker preferred)
+.PHONY: build-shim
+build-shim: ## Cross-compile the in-ava camera shim + relay (Docker preferred)
 	@if command -v docker >/dev/null 2>&1; then \
-		$(MAKE) -C phase2-cleaning docker || echo ">> Phase 2 docker build failed (optional). Phase 1 works without it."; \
+		$(MAKE) -C phase2-cleaning docker; \
 	elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
-		$(MAKE) -C phase2-cleaning all || echo ">> Phase 2 build failed (optional)."; \
+		$(MAKE) -C phase2-cleaning all; \
 	else \
-		echo ">> no docker / aarch64 gcc — skipping Phase 2 (optional). Phase 1 works without it."; \
+		echo ">> ERROR: need docker or gcc-aarch64-linux-gnu to build libcamtap.so + ava_cam_relay"; exit 1; \
 	fi
 
 # Assemble everything that gets shipped to the robot.
 .PHONY: stage
 stage: build-go2rtc
 	@echo ">> staging → $(STAGE)"
-	@rm -rf $(STAGE) && mkdir -p $(STAGE)/ava_conf_video_monitor
-	# go2rtc + our scripts/configs
+	@rm -rf $(STAGE) && mkdir -p $(STAGE)
 	cp $(BUILD)/go2rtc $(STAGE)/go2rtc
-	cp phase1-base/*.sh $(STAGE)/
-	cp phase1-base/go2rtc.yaml $(STAGE)/
 	cp phase2-cleaning/inject-ava.sh phase2-cleaning/run_ir.sh phase2-cleaning/go2rtc_ir.yaml $(STAGE)/
-	# Phase 2 (IR feed) artifacts — the recommended path
 	@[ -f phase2-cleaning/ava_cam_relay ] && cp phase2-cleaning/ava_cam_relay $(STAGE)/ || \
-		echo ">> (no ava_cam_relay — run 'make build-phase2')"
-	@[ -f phase2-cleaning/libcamtap.so ] && cp phase2-cleaning/libcamtap.so $(STAGE)/ || true
-	# Phase 1 Source A (optional — only if a built vacuumstreamer is configured)
-	@if [ -f "$(VM_BIN)" ] && [ -f "$(VM_SHIM)" ]; then \
-		cp $(VM_BIN) $(STAGE)/video_monitor; cp $(VM_SHIM) $(STAGE)/vacuumstreamer.so; \
-		cp $(VM_CONF)/* $(STAGE)/ava_conf_video_monitor/ 2>/dev/null || true; \
-		echo ">> included Source A (video_monitor) from $(VACUUMSTREAMER_DIR)"; \
-	else echo ">> (no vacuumstreamer — Phase 1 dock view skipped; Phase 2 IR feed is the main path)"; fi
+		echo ">> (no ava_cam_relay — run 'make build-shim')"
+	@[ -f phase2-cleaning/libcamtap.so ] && cp phase2-cleaning/libcamtap.so $(STAGE)/ || \
+		echo ">> (no libcamtap.so — run 'make build-shim')"
 	chmod +x $(STAGE)/*.sh $(STAGE)/go2rtc 2>/dev/null || true
-	chmod +x $(STAGE)/video_monitor 2>/dev/null || true
-
-.PHONY: check-vacuumstreamer
-check-vacuumstreamer:
-	@test -f "$(VM_BIN)"  || { echo "ERROR: $(VM_BIN) missing. Set VACUUMSTREAMER_DIR in config.mk to a built vacuumstreamer checkout."; exit 1; }
-	@test -f "$(VM_SHIM)" || { echo "ERROR: $(VM_SHIM) missing (run 'make' in your vacuumstreamer checkout first)."; exit 1; }
 
 # ---------------------------------------------------------------------------
 .PHONY: upload
-upload: stage ## Push build/stage to $(REMOTE_DIR) on the robot (ssh+cat, no sftp)
+upload: stage ## Push build/stage to $(REMOTE_DIR) on the robot (tar-over-ssh, no sftp)
 	@echo ">> mkdir $(REMOTE_DIR) on robot"
 	$(SSH) 'mkdir -p $(REMOTE_DIR)'
 	@echo ">> uploading via tar-over-ssh (BusyBox sshd has no sftp-server)"
-	tar -C $(STAGE) -cf - . | $(SSH) 'tar -C $(REMOTE_DIR) -xf - && chmod +x $(REMOTE_DIR)/*.sh $(REMOTE_DIR)/video_monitor $(REMOTE_DIR)/go2rtc $(REMOTE_DIR)/ava_cam_relay 2>/dev/null; echo "  uploaded to $(REMOTE_DIR):"; ls -la $(REMOTE_DIR)'
+	tar -C $(STAGE) -cf - . | $(SSH) 'tar -C $(REMOTE_DIR) -xf - && chmod +x $(REMOTE_DIR)/*.sh $(REMOTE_DIR)/go2rtc $(REMOTE_DIR)/ava_cam_relay 2>/dev/null; echo "  uploaded to $(REMOTE_DIR):"; ls -la $(REMOTE_DIR)'
 
-# ---------------------------------------------------------------------------
+# ---- install: inject the shim into ava + start the feed --------------------
 .PHONY: install
-install: ## One-time robot setup: config overlay + persistence in _root_postboot.sh
-	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/install.sh'
-
-.PHONY: uninstall
-uninstall: ## Remove from robot: stop, unmount, strip the postboot block
-	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/install.sh uninstall' || true
-
-# ---- Phase 2 (streaming during cleaning) — OPT-IN, restarts ava ------------
-.PHONY: install-phase2
-install-phase2: ## OPT-IN: inject the camera tap into ava (RESTARTS ava). Enables Source B.
+install: ## Inject the camera shim into ava + start the feed (RESTARTS ava)
 	@echo ">> This restarts ava (navigation). Robot should be idle on the dock."
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh install'
 
-.PHONY: uninstall-phase2
-uninstall-phase2: ## Remove the ava tap and restart stock ava
+.PHONY: uninstall
+uninstall: ## Remove the ava tap and restart stock ava
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh remove' || true
 
-.PHONY: phase2-status
-phase2-status: ## Show whether the in-ava tap is active
+.PHONY: status
+status: ## Show whether the in-ava tap is active
 	@$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh status'
 
-.PHONY: start-ir
-start-ir: ## Start the IR feed (relay + go2rtc) on the robot
+.PHONY: start
+start: ## Start the camera feed (relay + go2rtc) on the robot
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/run_ir.sh'
 
-.PHONY: stop-ir
-stop-ir: ## Stop the IR feed (relay + go2rtc)
+.PHONY: stop
+stop: ## Stop the camera feed (relay + go2rtc)
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/run_ir.sh --stop'
+
+.PHONY: restart
+restart: stop start ## Restart the camera feed (relay + go2rtc)
 
 .PHONY: watch
 watch: ## Print the URLs to watch the camera feed (via go2rtc)
@@ -134,29 +108,9 @@ watch: ## Print the URLs to watch the camera feed (via go2rtc)
 	echo "  Snap   : http://$$host:1984/api/frame.jpeg?src=camera"
 
 # ---------------------------------------------------------------------------
-.PHONY: start
-start: ## Start the supervisor daemon on the robot
-	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) setsid sh $(REMOTE_DIR)/supervisor.sh >/data/log/camstream_supervisor.log 2>&1 < /dev/null & echo "supervisor started"'
-
-.PHONY: stop
-stop: ## Stop the supervisor + both sources (camera released)
-	$(SSH) 'sh $(REMOTE_DIR)/supervisor.sh --stop; echo stopped'
-
-.PHONY: restart
-restart: stop start ## Restart the supervisor
-
-# ---------------------------------------------------------------------------
-.PHONY: status
-status: ## Show robot state, active source, listening ports, stream URLs
-	@$(SSH) 'sh $(REMOTE_DIR)/supervisor.sh --status'
-	@echo
-	@echo "Stream URLs (once a source is live):"
-	@echo "  web   : http://$(word 2,$(subst @, ,$(ROBOT))):1984"
-	@echo "  rtsp  : rtsp://$(word 2,$(subst @, ,$(ROBOT))):8554/camera"
-
 .PHONY: logs
-logs: ## Tail supervisor / video_monitor / relay logs on the robot
-	$(SSH) 'tail -n 40 /data/log/camstream_supervisor.log /data/log/video_monitor.log /data/log/ava_cam_relay.log 2>/dev/null'
+logs: ## Tail the relay + go2rtc logs on the robot
+	$(SSH) 'tail -n 40 /data/log/ir_relay.log /data/log/go2rtc.log 2>/dev/null'
 
 .PHONY: view
 view: ## Grab one still frame to build/frame.jpg (needs ffmpeg locally) to verify the feed
