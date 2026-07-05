@@ -41,6 +41,7 @@ make_wrapper() {
 	cat > "$WRAP" <<EOF
 #!/bin/sh
 export LD_PRELOAD=$DIR/libcamtap.so
+[ -f $DIR/camtap.env ] && . $DIR/camtap.env   # optional CAMTAP_MODE/EVERY/YONLY tuning
 exec $REAL "\$@"
 EOF
 	chmod +x "$WRAP" "$REAL"

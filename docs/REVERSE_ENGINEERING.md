@@ -106,28 +106,38 @@ The tap runs inside `ava` and must be minimal and defensive — it does a single
 into a tmpfs seqlock buffer (`/tmp/camtap.shm`) and returns. All encoding/network happens in a
 separate process (`ava_cam_relay`) so a bug there can never crash navigation.
 
-### On-device test result (important — the tap as implemented is NOT safe during cleaning)
+### On-device test result (the real blocker: the RGB camera does not stream during cleaning)
 
-Verified end to end on the real robot:
+Verified end to end on the real robot, with the tap instrumented with `calls` / `okframes` / `opens`
+counters:
 
-- **The hook works.** At ava startup the tap captured 55 real frames; the shm header decoded exactly:
-  magic `CMPT`, `672x504`, size `0x7C080 = 508032 = 672*504*3/2` — NV21 confirmed, dimensions and
-  layout all correct. LD_PRELOAD interposition of the dlopen'd plugin's cross-`.so` call works.
-- **But during *cleaning* it breaks capture.** With the tap active, starting a cleaning job produced
-  **continuous kernel ISP faults** (`[VIN_ERR] isp0 frame error, size 0`, `sunxi_isp_reset: ISP frame
-  number is 0`, `8856 pd io`), the frame counter never advanced past the 55 startup frames, and
-  `ava` got **no** frames either — i.e. the robot was navigating blind. Removing the tap and repeating
-  the exact same cleaning on stock `ava` produced **zero** ISP errors and normal capture.
-- **Conclusion:** copying the full 508 KB frame inside `ava`'s capture thread perturbs the tight
-  VIN/ISP buffer timing (added latency + L2 cache eviction every frame) enough to fault the ISP during
-  continuous cleaning capture. The brief docked startup burst tolerates it; sustained cleaning capture
-  does not. No reboot occurred (unlike a second camera open), but blinding navigation is unacceptable.
+- **The hook works.** At ava startup the tap captured a burst of real frames; the shm header decoded
+  exactly: magic `CMPT`, `672x504`, size `0x7C080 = 508032 = 672*504*3/2` — NV21 confirmed, dims and
+  layout correct. LD_PRELOAD interposition of the dlopen'd plugin's cross-`.so` call works.
+- **During cleaning there is nothing to tap.** In a 55 s cleaning run: `opens` went 1→2 (the RGB camera
+  *is* opened for cleaning), `calls` climbed slowly (~0.35/s — `camera_streamer` polls GetImageFrame),
+  but `okframes` stayed **flat at the startup value** — i.e. the real `GetImageFrame` returned 0 on
+  **every** cleaning call. The RGB camera never enters streaming state; no frame is ever produced for
+  us *or* for `ava`.
+- **Why:** disassembly of `AvaNodeCameraStreamer::AvaCameraCtrlMsgProcess(ava_msg_ai_camera_switch*)`
+  shows the RGB stream is gated by an "AI camera" switch: it sets `this+0xa4 = 3` (on) / `1` (off) from
+  the message byte. During autonomous cleaning that switch is **off** — the RGB camera (OV8856) is the
+  vendor's *remote-video-monitoring* camera, not the navigation sensor. Obstacle avoidance uses the
+  separate structured-light/ToF sensor (`ofilm0092`, sensor1), and `AIObstacleDetectionControlCapability`
+  is absent from Valetudo on this model. So `camera_streamer` opens the RGB camera during cleaning but
+  keeps it idle (never calls `SunxiCam::start`), and `GetImageFrame` returns 0.
+- The earlier "copy destabilizes the ISP" reading was **wrong**: in that run `okframes` was 0 too, so
+  our `memcpy` never actually executed — the ISP errors were run-to-run camera noise, not caused by us.
 
-So the full-copy in-ava tap is a dead end for live cleaning on this SoC. A viable Phase 2 would need a
-**zero-copy** path: the hook writes only tiny metadata (the ISP buffer's physical/ION address at
-`ImageFrame+0x18`, dims, seq) and the encoder DMA-imports that buffer directly — no CPU copy, no cache
-pollution in the capture thread. That is fragile (the buffer is requeued by `ava` right after) and was
-not pursued on the owner's working robot. Phase 1 (dock viewing) remains the reliable path.
+**Consequence:** on the W10 there is no continuous camera stream to tap during cleaning. The only way to
+get frames while cleaning would be to turn the AI-camera switch **on** during cleaning (publish
+`ava_msg_ai_camera_switch` with a non-zero byte, so `camera_streamer` calls `SunxiCam::start` and
+streams) — then the tap would capture without a second camera open. On a de-clouded (Valetudo) robot the
+vendor command that normally sends that message (the app's remote-view/cruise feature, Agora-based) is
+gone, so it would have to be forced from inside `ava` (set `this+0xa4=3` / call `SunxiCam::start` from
+the injected lib) — hacky, it fights `camera_streamer`'s own state machine, and its stability during
+cleaning is unproven. Not done on the owner's working robot without an explicit decision. Phase 1 (dock
+viewing) remains the reliable path.
 
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 

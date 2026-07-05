@@ -23,15 +23,18 @@
 #define CAMTAP_MAX_FRAME ((CAMTAP_MAX_W * CAMTAP_MAX_H * 3) / 2)
 
 struct camtap_shm {
-	volatile uint32_t magic;   // CAMTAP_MAGIC once initialized
-	volatile uint32_t seq;     // seqlock: odd = write in progress
-	volatile uint32_t width;
-	volatile uint32_t height;
-	volatile uint32_t size;    // valid bytes in data[] (= w*h*3/2)
-	volatile uint32_t format;  // 0 = NV21 (YVU420SP)
-	volatile uint64_t frames;  // total frames published (monotonic)
-	volatile uint64_t ts_ns;   // CLOCK_MONOTONIC of capture
-	uint8_t  data[CAMTAP_MAX_FRAME];
+	volatile uint32_t magic;    // 0   CAMTAP_MAGIC once initialized
+	volatile uint32_t seq;      // 4   seqlock: odd = write in progress
+	volatile uint32_t width;    // 8
+	volatile uint32_t height;   // 12
+	volatile uint32_t size;     // 16  valid bytes in data[] (= w*h*3/2, or 0)
+	volatile uint32_t format;   // 20  0 = NV21, 1 = Y-only(gray)
+	volatile uint64_t frames;   // 24  frames published (with data)
+	volatile uint64_t ts_ns;    // 32  CLOCK_MONOTONIC of last frame
+	volatile uint64_t calls;    // 40  GetImageFrame hook entries (diagnostic)
+	volatile uint64_t okframes; // 48  real GetImageFrame returned 1 (diagnostic)
+	volatile uint64_t opens;    // 56  OpenCamera hook entries (diagnostic)
+	uint8_t  data[CAMTAP_MAX_FRAME]; // 64
 };
 
 #endif
