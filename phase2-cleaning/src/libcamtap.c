@@ -53,7 +53,7 @@ enum { MODE_COPY = 0, MODE_META = 1 };
 
 static int g_w = 0, g_h = 0;
 static struct camtap_shm *g_shm = NULL;
-static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0, g_force = 0, g_grab = 0;
+static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0, g_force = 0, g_grab = 0, g_ir = 0;
 static int g_grabbed = 0;
 static int g_cfg = 0;
 static unsigned long long g_seen = 0;
@@ -70,6 +70,7 @@ static void camtap_cfg(void) {
 	const char *y = getenv("CAMTAP_YONLY"); if (y) g_yonly = atoi(y);
 	const char *f = getenv("CAMTAP_FORCE"); if (f) g_force = atoi(f);
 	const char *g = getenv("CAMTAP_GRAB"); if (g) g_grab = atoi(g);
+	const char *ir = getenv("CAMTAP_IR"); if (ir) g_ir = atoi(ir);
 }
 
 static void camtap_init_shm(void) {
@@ -116,6 +117,30 @@ static void camtap_publish(const void *nv21, int w, int h) {
 	g_shm->seq++;                 // -> even
 }
 
+// Cache of mmap'd V4L2 buffers (offset -> vaddr) so continuous IR capture does
+// not mmap/munmap every frame.
+#define CAMTAP_NMAP 16
+static struct { uint32_t off, len; void *va; } g_maps[CAMTAP_NMAP];
+static int g_nmaps = 0;
+static void *camtap_map(int fd, uint32_t off, uint32_t len) {
+	for (int i = 0; i < g_nmaps; i++) if (g_maps[i].off == off) return g_maps[i].va;
+	if (g_nmaps >= CAMTAP_NMAP || len == 0) return NULL;
+	void *m = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, (off_t)off);
+	if (m == MAP_FAILED) return NULL;
+	g_maps[g_nmaps].off = off; g_maps[g_nmaps].len = len; g_maps[g_nmaps].va = m;
+	return g_maps[g_nmaps++].va;
+}
+// Continuously copy the raw ToF frame (video1) into the shm ring via the seqlock.
+static void ir_publish(const void *data, uint32_t used) {
+	if (!g_shm || !data || used == 0 || used > CAMTAP_MAX_FRAME) return;
+	g_shm->seq++; __sync_synchronize();
+	g_shm->width = 224; g_shm->height = 1558; g_shm->size = used; g_shm->format = 100; // raw ToF u16
+	g_shm->ts_ns = now_ns();
+	memcpy(g_shm->data, data, used);
+	g_shm->frames++;
+	__sync_synchronize(); g_shm->seq++;
+}
+
 // --- diagnostic: intercept ioctl to see which /dev/videoN ava dequeues from ---
 // VIDIOC_DQBUF is _IOWR('V',17,struct v4l2_buffer): type byte 'V'=0x56, nr=17.
 // We match on (type,nr) so we don't depend on the struct size. v4l2_buffer has
@@ -148,6 +173,17 @@ int ioctl(int fd, unsigned long req, void *arg) {
 			if (v >= 0 && v < 4) {
 				g_shm->dqbuf[v]++;
 				g_shm->dqbytes[v] = *(uint32_t *)((char *)arg + 8); // bytesused
+				// continuous raw capture of the chosen device (default video1)
+				if (g_ir && v == g_ir) {
+					void *planes = *(void **)((char *)arg + 64);
+					if (planes) {
+						uint32_t used = *(uint32_t *)((char *)planes + 0);
+						uint32_t len  = *(uint32_t *)((char *)planes + 4);
+						uint32_t moff = *(uint32_t *)((char *)planes + 8);
+						void *va = camtap_map(fd, moff, len ? len : used);
+						if (va) ir_publish(va, used ? used : len);
+					}
+				}
 				// grab one raw multiplanar frame from the requested device
 				if (g_grab && !g_grabbed && v == g_grab) {
 					// v4l2_buffer (mplane): m.planes @ +64; plane: bytesused@0, length@4, mem_offset@8

@@ -59,6 +59,12 @@ typedef struct {
 	uint32_t nSizeC;
 } VencAllocateBufferParam;
 
+// Returned by VideoEncGetParameter for the SPS/PPS header index.
+typedef struct {
+	uint8_t *pBuffer;
+	uint32_t nLength;
+} VencHeaderData;
+
 // --- VencInputBuffer (standard CedarX layout) ------------------------------
 typedef struct {
 	unsigned long  nID;
@@ -92,6 +98,7 @@ typedef void  (*fn_VideoEncDestroy)(void*);
 typedef int   (*fn_VideoEncInit)(void*, VencBaseConfig*);
 typedef int   (*fn_VideoEncUnInit)(void*);
 typedef int   (*fn_VideoEncSetParameter)(void*, VENC_INDEXTYPE, void*);
+typedef int   (*fn_VideoEncGetParameter)(void*, int, void*);
 typedef int   (*fn_AllocInputBuffer)(void*, VencAllocateBufferParam*);
 typedef int   (*fn_GetOneAllocInputBuffer)(void*, VencInputBuffer*);
 typedef int   (*fn_FlushCacheAllocInputBuffer)(void*, VencInputBuffer*);

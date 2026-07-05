@@ -20,8 +20,8 @@ $(SHIM): src/libcamtap.c src/camtap_shm.h
 	$(CC) $(CFLAGS) -fPIC -shared src/libcamtap.c -o $@ -ldl
 	@echo ">> built $(SHIM) (aarch64 LD_PRELOAD tap)"
 
-$(RELAY): src/ava_cam_relay.c src/camtap_shm.h src/vencoder.h
-	$(CC) $(CFLAGS) src/ava_cam_relay.c -o $@ -ldl
+$(RELAY): src/ava_cam_relay.c src/camtap_shm.h src/ir_process.h src/jpeg_gray.h
+	$(CC) $(CFLAGS) src/ava_cam_relay.c -o $@ -lm
 	@echo ">> built $(RELAY) (aarch64 encoder/relay)"
 
 # Reproducible build with no host toolchain required (needs docker).

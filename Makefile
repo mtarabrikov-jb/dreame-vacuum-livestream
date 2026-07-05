@@ -59,24 +59,26 @@ build-phase2: ## Cross-compile the optional Phase 2 tap+relay (Docker preferred)
 
 # Assemble everything that gets shipped to the robot.
 .PHONY: stage
-stage: check-vacuumstreamer build-go2rtc
+stage: build-go2rtc
 	@echo ">> staging → $(STAGE)"
 	@rm -rf $(STAGE) && mkdir -p $(STAGE)/ava_conf_video_monitor
-	# Source A (from your vacuumstreamer checkout)
-	cp $(VM_BIN)  $(STAGE)/video_monitor
-	cp $(VM_SHIM) $(STAGE)/vacuumstreamer.so
-	cp $(VM_CONF)/* $(STAGE)/ava_conf_video_monitor/
-	# go2rtc
+	# go2rtc + our scripts/configs
 	cp $(BUILD)/go2rtc $(STAGE)/go2rtc
-	# our scripts + go2rtc config
 	cp phase1-base/*.sh $(STAGE)/
 	cp phase1-base/go2rtc.yaml $(STAGE)/
-	cp phase2-cleaning/inject-ava.sh $(STAGE)/
-	# Phase 2 artifacts if they were built (tap + relay)
+	cp phase2-cleaning/inject-ava.sh phase2-cleaning/run_ir.sh phase2-cleaning/go2rtc_ir.yaml $(STAGE)/
+	# Phase 2 (IR feed) artifacts — the recommended path
 	@[ -f phase2-cleaning/ava_cam_relay ] && cp phase2-cleaning/ava_cam_relay $(STAGE)/ || \
-		echo ">> (no ava_cam_relay — Source B disabled; Phase 1 still fully functional)"
+		echo ">> (no ava_cam_relay — run 'make build-phase2')"
 	@[ -f phase2-cleaning/libcamtap.so ] && cp phase2-cleaning/libcamtap.so $(STAGE)/ || true
-	chmod +x $(STAGE)/*.sh $(STAGE)/video_monitor $(STAGE)/go2rtc 2>/dev/null || true
+	# Phase 1 Source A (optional — only if a built vacuumstreamer is configured)
+	@if [ -f "$(VM_BIN)" ] && [ -f "$(VM_SHIM)" ]; then \
+		cp $(VM_BIN) $(STAGE)/video_monitor; cp $(VM_SHIM) $(STAGE)/vacuumstreamer.so; \
+		cp $(VM_CONF)/* $(STAGE)/ava_conf_video_monitor/ 2>/dev/null || true; \
+		echo ">> included Source A (video_monitor) from $(VACUUMSTREAMER_DIR)"; \
+	else echo ">> (no vacuumstreamer — Phase 1 dock view skipped; Phase 2 IR feed is the main path)"; fi
+	chmod +x $(STAGE)/*.sh $(STAGE)/go2rtc 2>/dev/null || true
+	chmod +x $(STAGE)/video_monitor 2>/dev/null || true
 
 .PHONY: check-vacuumstreamer
 check-vacuumstreamer:
@@ -113,6 +115,23 @@ uninstall-phase2: ## Remove the ava tap and restart stock ava
 .PHONY: phase2-status
 phase2-status: ## Show whether the in-ava tap is active
 	@$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/inject-ava.sh status'
+
+.PHONY: start-ir
+start-ir: ## Start the IR feed (relay + go2rtc) on the robot
+	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/run_ir.sh'
+
+.PHONY: stop-ir
+stop-ir: ## Stop the IR feed (relay + go2rtc)
+	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/run_ir.sh --stop'
+
+.PHONY: watch
+watch: ## Print the URLs to watch the IR feed (via go2rtc)
+	@host="$(word 2,$(subst @, ,$(ROBOT)))"; \
+	echo "Live infrared feed (only while the robot is cleaning):"; \
+	echo "  Web UI : http://$$host:1984/  (stream: ircam)"; \
+	echo "  RTSP   : rtsp://$$host:8554/ircam    (VLC: Media > Open Network Stream)"; \
+	echo "  WebRTC : http://$$host:1984/webrtc.html?src=ircam"; \
+	echo "  Snap   : http://$$host:1984/api/frame.jpeg?src=ircam"
 
 # ---------------------------------------------------------------------------
 .PHONY: start

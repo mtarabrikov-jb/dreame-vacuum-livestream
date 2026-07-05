@@ -1,0 +1,16 @@
+# go2rtc config for the Phase 2 infrared feed.
+# The relay serves MJPEG on loopback :8090; go2rtc consumes it and re-serves.
+streams:
+  ircam: "http://127.0.0.1:8090/stream"
+
+api:
+  listen: ":1984"      # web UI + snapshot API (http://<ip>:1984/)
+
+rtsp:
+  listen: ":8554"      # rtsp://<ip>:8554/ircam
+
+webrtc:
+  listen: ":8555"
+
+log:
+  level: info

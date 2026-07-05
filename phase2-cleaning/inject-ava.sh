@@ -57,21 +57,25 @@ persist_on() {
 	{ echo "$BEGIN"; echo "[ -x $DIR/inject-ava.sh ] && REMOTE_DIR=$DIR sh $DIR/inject-ava.sh boot"; echo "$END"; } >> "$POSTBOOT"
 }
 persist_off() { [ -f "$POSTBOOT" ] && sed -i "/$BEGIN/,/$END/d" "$POSTBOOT"; }
+ensure_env() { [ -f "$DIR/camtap.env" ] || printf "export CAMTAP_IR=1\n" > "$DIR/camtap.env"; }
+start_feed() { [ -x "$DIR/run_ir.sh" ] && REMOTE_DIR="$DIR" sh "$DIR/run_ir.sh" >/dev/null 2>&1; }
 
 case "${1:-status}" in
 	install)
 		[ -f "$DIR/libcamtap.so" ] || { echo "ERROR: $DIR/libcamtap.so missing (build + upload Phase 2 first)"; exit 1; }
-		make_wrapper; bind_on; persist_on; restart_ava
-		if tap_active; then echo ">> OK: libcamtap active in ava. Start cleaning, then check /tmp/camtap.shm."; else echo ">> WARN: tap not detected in ava maps yet; check 'ps | grep ava' and logs."; fi
+		ensure_env; make_wrapper; bind_on; persist_on; restart_ava; start_feed
+		if tap_active; then echo ">> OK: tap active + IR feed up. Watch via go2rtc while cleaning (make watch)."; else echo ">> WARN: tap not detected in ava maps yet; check 'ps | grep ava' and logs."; fi
 		;;
 	remove)
+		[ -x "$DIR/run_ir.sh" ] && REMOTE_DIR="$DIR" sh "$DIR/run_ir.sh" --stop >/dev/null 2>&1
 		persist_off; bind_off; restart_ava
 		tap_active && echo ">> WARN: tap still present" || echo ">> removed; stock ava running"
 		;;
 	boot)
-		make_wrapper; bind_on
+		ensure_env; make_wrapper; bind_on
 		# if ava already came up stock (postboot ran after ava.sh), reload it once
 		tap_active || restart_ava
+		start_feed
 		;;
 	status)
 		echo -n "bind mount : "; grep -q ' /usr/bin/ava ' /proc/mounts && echo yes || echo no
