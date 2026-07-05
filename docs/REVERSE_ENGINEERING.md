@@ -145,8 +145,12 @@ single-ISP contention; the earlier "one ISP" reading was wrong):
 
 - `/dev/video2` = the **RGB** camera (verified: its `VIDIOC_S_FMT` is `672x504 NV21`, sizeimage
   `508032`). It is opened during cleaning but **does not dequeue** — `dqbuf[2]` stays flat. The RGB
-  camera is simply not enabled while cleaning (the AI-camera switch is off), and forcing
-  `SunxiCam::start()` did not make it queue/stream.
+  camera is simply not enabled while cleaning (the AI-camera switch is off). A dedicated attempt to
+  "force" it (aggressive `shutdown()`+`start()` on the SunxiCam, 8 re-inits, **15 sensor power cycles**
+  in one cleaning) produced **zero** new RGB frames (`dqbuf[2]` stayed at its startup value) and a
+  storm of **278 ISP errors** — the RGB capture pipeline (MIPI/CSI clock or ISP link) is gated off
+  during cleaning at a level `SunxiCam::start` cannot re-enable. So RGB cannot be coerced to stream
+  while cleaning.
 - `/dev/video1` = the **ToF / depth sensor** path. It **does** stream during cleaning: `dqbuf[1]` climbed
   0→167 in ~26 s (~8 fps). But its `S_FMT` is `224x1558`, fourcc **`BG12`** (12-bit Bayer/raw),
   sizeimage `698368` — i.e. **raw ToF sensor data** (a tall stack of phase sub-frames), not a viewable
