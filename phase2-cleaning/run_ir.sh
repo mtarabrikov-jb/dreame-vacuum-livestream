@@ -37,7 +37,7 @@ setsid "$GO2RTC" -config "$DIR/go2rtc_ir.yaml" >/data/log/go2rtc.log 2>&1 < /dev
 sleep 1
 
 IP=$(ip route get 1 2>/dev/null | awk '{print $NF; exit}')
-echo "IR feed up. Watch it (only while cleaning):"
-echo "  RTSP  : rtsp://${IP:-<robot-ip>}:8554/ircam"
-echo "  Web   : http://${IP:-<robot-ip>}:1984/  (stream: ircam)"
-echo "  Snap  : http://${IP:-<robot-ip>}:1984/api/frame.jpeg?src=ircam"
+echo "Camera feed up (color RGB on the dock, infrared while cleaning):"
+echo "  RTSP  : rtsp://${IP:-<robot-ip>}:8554/camera"
+echo "  Web   : http://${IP:-<robot-ip>}:1984/  (stream: camera)"
+echo "  Snap  : http://${IP:-<robot-ip>}:1984/api/frame.jpeg?src=camera"

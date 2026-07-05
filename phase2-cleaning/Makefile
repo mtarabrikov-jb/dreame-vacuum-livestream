@@ -17,7 +17,7 @@ RELAY   := ava_cam_relay
 all: $(SHIM) $(RELAY)
 
 $(SHIM): src/libcamtap.c src/camtap_shm.h
-	$(CC) $(CFLAGS) -fPIC -shared src/libcamtap.c -o $@ -ldl
+	$(CC) $(CFLAGS) -fPIC -shared src/libcamtap.c -o $@ -ldl -lpthread
 	@echo ">> built $(SHIM) (aarch64 LD_PRELOAD tap)"
 
 $(RELAY): src/ava_cam_relay.c src/camtap_shm.h src/ir_process.h src/jpeg_gray.h

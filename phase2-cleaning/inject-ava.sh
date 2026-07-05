@@ -57,7 +57,7 @@ persist_on() {
 	{ echo "$BEGIN"; echo "[ -x $DIR/inject-ava.sh ] && REMOTE_DIR=$DIR sh $DIR/inject-ava.sh boot"; echo "$END"; } >> "$POSTBOOT"
 }
 persist_off() { [ -f "$POSTBOOT" ] && sed -i "/$BEGIN/,/$END/d" "$POSTBOOT"; }
-ensure_env() { [ -f "$DIR/camtap.env" ] || printf "export CAMTAP_IR=1\n" > "$DIR/camtap.env"; }
+ensure_env() { [ -f "$DIR/camtap.env" ] || printf "export CAMTAP_FORCE=5\nexport CAMTAP_IR=1\n" > "$DIR/camtap.env"; }
 start_feed() { [ -x "$DIR/run_ir.sh" ] && REMOTE_DIR="$DIR" sh "$DIR/run_ir.sh" >/dev/null 2>&1; }
 
 case "${1:-status}" in

@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "camtap_shm.h"
@@ -40,7 +41,13 @@
 #define SYM_OPEN  "_ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii"
 #define SYM_FRAME "_ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE"
 #define SYM_START "_ZN9sunxi_cam8SunxiCam5startEiiiii"
+#define SYM_CLOSE "_ZN9sunxi_cam8SunxiCam11CloseCameraEv"
+#define SYM_RETURN "_ZN9sunxi_cam8SunxiCam16ReturnImageFrameEPNS_10ImageFrameE"
 #define IMAGEFRAME_DATA_OFF 0x20
+static void *g_sunxi_self = NULL;    // last SunxiCam 'this' seen in the hooks
+typedef int (*close_fn)(void *);
+typedef int (*return_fn)(void *, void *);
+static void maybe_start_bg(void);    // starts the FORCE>=4 background thread lazily
 // SunxiCam object layout (verified): self+0 = ctx pointer, self+8 = state (3=streaming)
 #define SUNXI_CTX_OFF   0x00
 #define SUNXI_STATE_OFF 0x08
@@ -130,9 +137,12 @@ static void *camtap_map(int fd, uint32_t off, uint32_t len) {
 	g_maps[g_nmaps].off = off; g_maps[g_nmaps].len = len; g_maps[g_nmaps].va = m;
 	return g_maps[g_nmaps++].va;
 }
+static volatile uint64_t g_last_ir_ns = 0;   // last ToF(video1) frame time; fresh = cleaning
+
 // Continuously copy the raw ToF frame (video1) into the shm ring via the seqlock.
 static void ir_publish(const void *data, uint32_t used) {
 	if (!g_shm || !data || used == 0 || used > CAMTAP_MAX_FRAME) return;
+	g_last_ir_ns = now_ns();
 	g_shm->seq++; __sync_synchronize();
 	g_shm->width = 224; g_shm->height = 1558; g_shm->size = used; g_shm->format = 100; // raw ToF u16
 	g_shm->ts_ns = now_ns();
@@ -221,6 +231,8 @@ int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
 	camtap_cfg();
 	if (width > 0 && height > 0) { g_w = width; g_h = height; }
 	g_a1 = a1; g_fourcc = fourcc; g_a3 = a3;   // save for a possible force-start
+	g_sunxi_self = self;
+	maybe_start_bg();
 	if (!g_shm) camtap_init_shm();
 	if (g_shm) { g_shm->width = (uint32_t)width; g_shm->height = (uint32_t)height; g_shm->opens++; }
 	return real ? real(self, a1, fourcc, a3, width, height) : -1;
@@ -234,14 +246,13 @@ int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
 // Find the single AvaNodeCameraStreamer instance in ava's heap by its vtable
 // pointer (object[0] == vtable_symbol + 16). Cached after the first success.
 static void *find_streamer(void) {
-	static void *cached = (void *)-1;
-	if (cached != (void *)-1) return cached;
-	cached = NULL;
+	static void *cached = NULL;
+	if (cached) return cached;                 // cache successes only (retry on miss)
 	void *h = dlopen("/ava/lib/node_camera_streamer.so", RTLD_NOLOAD | RTLD_NOW);
 	if (!h) h = dlopen("node_camera_streamer.so", RTLD_NOLOAD | RTLD_NOW);
 	void *vt = h ? dlsym(h, "_ZTVN21avanodecamerastreamer21AvaNodeCameraStreamerE") : NULL;
-	if (!vt) return NULL;
-	uintptr_t want = (uintptr_t)vt + 16;   // vtable pointer stored in an object
+	if (!vt) return NULL;                       // node not loaded yet -> retry later
+	uintptr_t want = (uintptr_t)vt + 16;        // vtable pointer stored in an object
 	FILE *f = fopen("/proc/self/maps", "r");
 	if (!f) return NULL;
 	char line[300];
@@ -259,7 +270,7 @@ static void *find_streamer(void) {
 		if (scanned > 512ul * 1024 * 1024) break;                  // safety cap
 	}
 	fclose(f);
-	return cached;
+	return NULL;
 }
 
 // Force level 3: set the AI-camera switch (streamer+0xa4 = 3) so camera_streamer
@@ -275,8 +286,75 @@ static void force_ai_switch(void) {
 	if (g_shm) g_shm->sw_hits++;
 }
 
+// Background thread (CAMTAP_FORCE>=4): proactively hold the AI-camera switch on,
+// independent of the GetImageFrame hook (which stops being called once
+// camera_streamer closes the RGB camera). This is how we keep RGB streaming on
+// the dock. Started from a constructor at ava load.
+static void *switch_thread(void *arg) {
+	(void)arg;
+	for (int i = 0; i < 40 && !find_streamer(); i++) sleep(1);   // wait for the node
+	while (1) {
+		if (!g_shm) camtap_init_shm();
+		force_ai_switch();
+		sleep(1);
+	}
+	return NULL;
+}
+// FORCE=5: keep the RGB camera open (CloseCamera hook is a no-op) and drive
+// SunxiCam::GetImageFrame ourselves at ~15fps, since camera_streamer stops
+// polling it after the boot burst. The sensor is already streaming (state 3),
+// so we just keep dequeuing real frames.
+// Own the RGB camera independently: camera_streamer only touches it for the boot
+// burst and is idle afterwards on the dock, so our thread does its own
+// open -> capture-a-burst -> close cycle to produce a continuous RGB stream.
+static void *drive_thread(void *arg) {
+	(void)arg;
+	frame_fn  real_gif    = (frame_fn) dlsym(RTLD_NEXT, SYM_FRAME);
+	open_fn   real_open   = (open_fn)  dlsym(RTLD_NEXT, SYM_OPEN);
+	close_fn  real_close  = (close_fn) dlsym(RTLD_NEXT, SYM_CLOSE);
+	return_fn real_return = (return_fn)dlsym(RTLD_NEXT, SYM_RETURN);
+	if (!real_gif || !real_open || !real_close || !real_return) return NULL;
+	for (int i = 0; i < 40 && !(g_sunxi_self && g_w > 0); i++) sleep(1);
+	sleep(8);                            // let camera_streamer's boot burst finish
+	uint8_t imgframe[64];
+	while (1) {
+		void *self = g_sunxi_self;
+		// Yield the camera while cleaning: the ToF path (video1) is streaming and
+		// ava is using the same SunxiCam, so don't touch RGB then.
+		if (!self || g_w <= 0 || (now_ns() - g_last_ir_ns) < 2000000000ull) { sleep(1); continue; }
+		if (!g_shm) camtap_init_shm();
+		real_open(self, g_a1, g_fourcc, g_a3, g_w, g_h);
+		if (g_shm) g_shm->forced++;
+		int miss = 0;
+		while ((now_ns() - g_last_ir_ns) >= 2000000000ull) {   // until cleaning starts
+			memset(imgframe, 0, sizeof imgframe);
+			if (real_gif(self, imgframe) == 1) {
+				camtap_publish(*(void **)((char *)imgframe + IMAGEFRAME_DATA_OFF), g_w, g_h);
+				real_return(self, imgframe);   // re-queue the buffer (qbuf) -> keep streaming
+				miss = 0;
+			} else if (++miss > 20) break;     // truly stalled -> re-open
+			usleep(55000);                     // ~18 fps
+		}
+		real_close(self);
+		usleep(40000);
+	}
+	return NULL;
+}
+// Start the background thread LAZILY from the first hook call (ava is fully
+// initialized by then) — NOT from a constructor, where pthread_create + dlsym
+// during ld.so init can deadlock and break ava's camera init.
+static pthread_once_t g_bg_once = PTHREAD_ONCE_INIT;
+static void start_bg(void) {
+	pthread_t t;
+	if (g_force == 4) pthread_create(&t, NULL, switch_thread, NULL);
+	else if (g_force >= 5) pthread_create(&t, NULL, drive_thread, NULL);
+}
+static void maybe_start_bg(void) { if (g_force >= 4) pthread_once(&g_bg_once, start_bg); }
+
+
 typedef int (*shutdown_fn)(void*);
 static void maybe_force_start(void *self) {
+	if (g_force >= 4) return;                    // handled by switch_thread
 	if (g_force == 3) { force_ai_switch(); return; }
 	static start_fn real_start = NULL;
 	static shutdown_fn real_shutdown = NULL;
@@ -304,6 +382,8 @@ int _ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE(void *self, void *fr
 	static frame_fn real = NULL;
 	if (!real) real = (frame_fn)dlsym(RTLD_NEXT, SYM_FRAME);
 	camtap_cfg();
+	g_sunxi_self = self;
+	maybe_start_bg();
 	if (!g_shm) camtap_init_shm();
 	if (g_shm) g_shm->calls++;                 // every hook entry (diagnostic)
 	// record SunxiCam state each call (diagnostic), and force-start if configured

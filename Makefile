@@ -125,13 +125,13 @@ stop-ir: ## Stop the IR feed (relay + go2rtc)
 	$(SSH) 'REMOTE_DIR=$(REMOTE_DIR) sh $(REMOTE_DIR)/run_ir.sh --stop'
 
 .PHONY: watch
-watch: ## Print the URLs to watch the IR feed (via go2rtc)
+watch: ## Print the URLs to watch the camera feed (via go2rtc)
 	@host="$(word 2,$(subst @, ,$(ROBOT)))"; \
-	echo "Live infrared feed (only while the robot is cleaning):"; \
-	echo "  Web UI : http://$$host:1984/  (stream: ircam)"; \
-	echo "  RTSP   : rtsp://$$host:8554/ircam    (VLC: Media > Open Network Stream)"; \
-	echo "  WebRTC : http://$$host:1984/webrtc.html?src=ircam"; \
-	echo "  Snap   : http://$$host:1984/api/frame.jpeg?src=ircam"
+	echo "Live camera feed — color RGB on the dock, infrared while cleaning:"; \
+	echo "  Web UI : http://$$host:1984/  (stream: camera)"; \
+	echo "  RTSP   : rtsp://$$host:8554/camera    (VLC: Media > Open Network Stream)"; \
+	echo "  WebRTC : http://$$host:1984/webrtc.html?src=camera"; \
+	echo "  Snap   : http://$$host:1984/api/frame.jpeg?src=camera"
 
 # ---------------------------------------------------------------------------
 .PHONY: start

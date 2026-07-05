@@ -52,6 +52,11 @@ static void tof_to_gray(const uint16_t *raw, int band, unsigned char *gray) {
 		if (v < 0) v = 0; if (v > 255) v = 255;
 		gray[i] = (unsigned char)v;
 	}
+	// The ToF sensor is mounted rotated vs the robot's forward view; rotate the
+	// image 180 degrees (reverse the pixel order) so it matches how you'd look.
+	for (int i = 0, j = IR_SUB * TOF_W - 1; i < j; i++, j--) {
+		unsigned char t = gray[i]; gray[i] = gray[j]; gray[j] = t;
+	}
 }
 
 static void ir_upscale(const unsigned char *src, int w, int h, int sc, unsigned char *dst) {

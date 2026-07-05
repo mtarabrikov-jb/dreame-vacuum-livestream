@@ -46,18 +46,20 @@ static struct camtap_shm *open_shm(void) {
 	return (p == MAP_FAILED) ? NULL : (struct camtap_shm *)p;
 }
 
-// consistent read of the raw ToF frame via the seqlock; returns 1 if new
-static int read_raw(struct camtap_shm *shm, uint16_t *out, uint64_t *last) {
+// consistent read of one frame (any format) via the seqlock; returns 1 if new
+static int read_frame(struct camtap_shm *shm, uint8_t *out, int cap,
+                      int *w, int *h, int *fmt, int *size, uint64_t *last) {
 	uint32_t s0 = shm->seq;
 	if (s0 & 1u) return 0;
 	__sync_synchronize();
 	uint64_t fr = shm->frames;
 	if (fr == *last) return 0;
-	if (shm->format != 100 || shm->size < TOF_W * TOF_H * 2) return 0;
-	memcpy(out, shm->data, TOF_W * TOF_H * 2);
+	int ww = shm->width, hh = shm->height, ff = shm->format, sz = shm->size;
+	if (sz <= 0 || sz > cap) return 0;
+	memcpy(out, shm->data, (size_t)sz);
 	__sync_synchronize();
 	if (shm->seq != s0) return 0;
-	*last = fr;
+	*w = ww; *h = hh; *fmt = ff; *size = sz; *last = fr;
 	return 1;
 }
 
@@ -91,17 +93,18 @@ int main(int argc, char **argv) {
 	}
 	fprintf(stderr, "attached to %s\n", CAMTAP_SHM_PATH);
 
-	static uint16_t raw[TOF_W * TOF_H];
+	static unsigned char frame[CAMTAP_MAX_FRAME];
 	static unsigned char gray[IR_SUB * TOF_W];
-	static unsigned char big[IR_SUB * TOF_W * 16];       // up to scale 4
-	static unsigned char jpg[IR_SUB * TOF_W * 16 + 4096];
+	static unsigned char big[IR_SUB * TOF_W * 16];       // IR upscale, up to scale 4
+	static unsigned char jpg[2 * 1024 * 1024];
+	int w = 0, h = 0, fmt = 0, size = 0;
 	uint64_t last = 0;
 
 	if (stats) {
 		uint64_t cnt = 0;
 		while (!g_stop) {
-			if (read_raw(shm, raw, &last)) { if (++cnt % 15 == 0)
-				fprintf(stderr, "tap: ToF %dx%d, %llu frames\n", TOF_W, TOF_H, (unsigned long long)shm->frames); }
+			if (read_frame(shm, frame, sizeof frame, &w, &h, &fmt, &size, &last)) { if (++cnt % 15 == 0)
+				fprintf(stderr, "tap: %dx%d fmt=%d, %llu frames\n", w, h, fmt, (unsigned long long)shm->frames); }
 			usleep(4000);
 		}
 		return 0;
@@ -110,14 +113,12 @@ int main(int argc, char **argv) {
 	int srv = tcp_listen(port);
 	if (srv < 0) return 1;
 	fprintf(stderr, "MJPEG on 127.0.0.1:%d/  (band=%d scale=%d q=%d) -> point go2rtc here\n", port, band, scale, qual);
-	int fw = TOF_W * scale, fh = IR_SUB * scale;
 	char hdr[128];
 
 	while (!g_stop) {
 		int cl = accept(srv, NULL, NULL);
 		if (cl < 0) continue;
-		// any request path -> the MJPEG stream (go2rtc just opens the URL)
-		char req[512]; int rn = read(cl, req, sizeof req - 1); (void)rn;
+		char req[512]; int rn = read(cl, req, sizeof req - 1); (void)rn;   // go2rtc opens the URL
 		const char *h0 = "HTTP/1.0 200 OK\r\n"
 			"Content-Type: multipart/x-mixed-replace; boundary=ffcam\r\n"
 			"Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -125,10 +126,16 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "consumer connected\n");
 		uint64_t l2 = 0;
 		while (!g_stop) {
-			if (!read_raw(shm, raw, &l2)) { usleep(6000); continue; }
-			tof_to_gray(raw, band, gray);
-			ir_upscale(gray, TOF_W, IR_SUB, scale, big);
-			int n = jpeg_encode_gray(big, fw, fh, qual, jpg);
+			if (!read_frame(shm, frame, sizeof frame, &w, &h, &fmt, &size, &l2)) { usleep(6000); continue; }
+			int n;
+			if (fmt == 100) {                       // ToF -> grayscale infrared (cleaning)
+				tof_to_gray((const uint16_t *)frame, band, gray);
+				ir_upscale(gray, TOF_W, IR_SUB, scale, big);
+				n = jpeg_encode_gray(big, TOF_W * scale, IR_SUB * scale, qual, jpg);
+			} else {                                // NV21 -> full color (docked)
+				n = jpeg_encode_nv21(frame, w, h, qual, jpg);
+			}
+			if (n <= 0) continue;
 			int hl = snprintf(hdr, sizeof hdr,
 				"--ffcam\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", n);
 			if (send_all(cl, hdr, hl) < 0 || send_all(cl, jpg, n) < 0 || send_all(cl, "\r\n", 2) < 0) break;
