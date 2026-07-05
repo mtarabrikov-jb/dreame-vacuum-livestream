@@ -159,6 +159,15 @@ single-ISP contention; the earlier "one ISP" reading was wrong):
   Both confirm the same wall: during cleaning the RGB pipeline is gated off below software control
   (power/clock/firmware policy — the two ISPs are independent, so it is *not* ISP contention). The
   sensor can be powered but delivers no MIPI frames while cleaning, so RGB cannot be made to stream.
+
+- **Manual / remote-control mode is the same.** Entering `HighResolutionManualControlCapability` (with
+  or without movement) does **not** turn the RGB camera on either: `video1` (ToF) streams continuously
+  (~8–10 fps, even standing still), while `video2` (RGB) stays flat and `isp0` runs a continuous error
+  loop — `[VIN_ERR] isp0 frame error, size 0` / `sunxi_isp_reset: ISP frame number is 0` / `8856 pd io`.
+  So the RGB pipeline fails whenever the robot is in any *active* mode (cleaning or manual), not just
+  cleaning. RGB only works when fully idle/docked (the init burst at camera cold-open, and the
+  video_monitor remote-view path used by Phase 1). Conclusion is unchanged: no live RGB view while the
+  robot is operating.
 - `/dev/video1` = the **ToF / depth sensor** path. It **does** stream during cleaning: `dqbuf[1]` climbed
   0→167 in ~26 s (~8 fps). But its `S_FMT` is `224x1558`, fourcc **`BG12`** (12-bit Bayer/raw),
   sizeimage `698368` — i.e. **raw ToF sensor data** (a tall stack of phase sub-frames), not a viewable
