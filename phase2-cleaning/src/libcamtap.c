@@ -139,6 +139,23 @@ static void *camtap_map(int fd, uint32_t off, uint32_t len) {
 }
 static volatile uint64_t g_last_ir_ns = 0;   // last ToF(video1) frame time; fresh = cleaning
 
+// --- crash-safe camera ownership ------------------------------------------
+// ava (camera_streamer) and our RGB drive thread both use the SAME SunxiCam
+// object. Concurrent / double-owner access deadlocked ava. Fix: ONE mutex
+// serializes every real SunxiCam call (from the drive thread AND from ava, whose
+// calls all pass through our interposed hooks), plus explicit ownership handoff.
+static pthread_mutex_t g_cam_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t g_cs_active_ns = 0;    // last time ava touched the camera (via a hook)
+enum { OWN_NONE = 0, OWN_DRIVE = 1, OWN_STREAMER = 2 };
+static volatile int g_owner = OWN_NONE;
+// True when ava is using (or about to use) the camera, so the drive thread must
+// keep off it: recent camera_streamer hook activity, or ToF streaming (cleaning).
+static int cs_busy(void) {
+	uint64_t n = now_ns();
+	return (g_cs_active_ns && n - g_cs_active_ns < 6000000000ull)
+	    || (g_last_ir_ns   && n - g_last_ir_ns   < 2000000000ull);
+}
+
 // Continuously copy the raw ToF frame (video1) into the shm ring via the seqlock.
 static void ir_publish(const void *data, uint32_t used) {
 	if (!g_shm || !data || used == 0 || used > CAMTAP_MAX_FRAME) return;
@@ -226,16 +243,37 @@ int ioctl(int fd, unsigned long req, void *arg) {
 
 int _ZN9sunxi_cam8SunxiCam10OpenCameraEiiiii(void *self, int a1, int fourcc,
                                              int a3, int width, int height) {
-	static open_fn real = NULL;
+	static open_fn real = NULL; static close_fn rclose = NULL;
 	if (!real) real = (open_fn)dlsym(RTLD_NEXT, SYM_OPEN);
+	if (!rclose) rclose = (close_fn)dlsym(RTLD_NEXT, SYM_CLOSE);
 	camtap_cfg();
 	if (width > 0 && height > 0) { g_w = width; g_h = height; }
-	g_a1 = a1; g_fourcc = fourcc; g_a3 = a3;   // save for a possible force-start
+	g_a1 = a1; g_fourcc = fourcc; g_a3 = a3;   // remember params for the drive thread
 	g_sunxi_self = self;
+	g_cs_active_ns = now_ns();                  // ava is claiming the camera now
 	maybe_start_bg();
 	if (!g_shm) camtap_init_shm();
 	if (g_shm) { g_shm->width = (uint32_t)width; g_shm->height = (uint32_t)height; g_shm->opens++; }
-	return real ? real(self, a1, fourcc, a3, width, height) : -1;
+	pthread_mutex_lock(&g_cam_lock);
+	if (g_owner == OWN_DRIVE && rclose) { rclose(self); }   // take it back from the drive thread
+	int r = real ? real(self, a1, fourcc, a3, width, height) : -1;
+	g_owner = OWN_STREAMER;
+	pthread_mutex_unlock(&g_cam_lock);
+	return r;
+}
+
+// ava closing the camera -> ownership returns to nobody (drive thread may resume
+// once ava has been quiet for a while).
+int _ZN9sunxi_cam8SunxiCam11CloseCameraEv(void *self) {
+	static close_fn real = NULL;
+	if (!real) real = (close_fn)dlsym(RTLD_NEXT, SYM_CLOSE);
+	camtap_cfg();
+	g_cs_active_ns = now_ns();
+	pthread_mutex_lock(&g_cam_lock);
+	int r = real ? real(self) : 0;
+	if (g_owner == OWN_STREAMER) g_owner = OWN_NONE;
+	pthread_mutex_unlock(&g_cam_lock);
+	return r;
 }
 
 // Variant B: when real GetImageFrame yields no frame, optionally force the
@@ -300,13 +338,10 @@ static void *switch_thread(void *arg) {
 	}
 	return NULL;
 }
-// FORCE=5: keep the RGB camera open (CloseCamera hook is a no-op) and drive
-// SunxiCam::GetImageFrame ourselves at ~15fps, since camera_streamer stops
-// polling it after the boot burst. The sensor is already streaming (state 3),
-// so we just keep dequeuing real frames.
-// Own the RGB camera independently: camera_streamer only touches it for the boot
-// burst and is idle afterwards on the dock, so our thread does its own
-// open -> capture-a-burst -> close cycle to produce a continuous RGB stream.
+// RGB drive thread (CAMTAP_FORCE=5): produce a continuous color stream on the
+// dock by owning the SunxiCam ourselves — but ONLY while ava isn't using it, and
+// with every SunxiCam call under g_cam_lock so we never race ava. Ownership is
+// handed back to ava the instant it wants the camera (cs_busy()).
 static void *drive_thread(void *arg) {
 	(void)arg;
 	frame_fn  real_gif    = (frame_fn) dlsym(RTLD_NEXT, SYM_FRAME);
@@ -314,29 +349,37 @@ static void *drive_thread(void *arg) {
 	close_fn  real_close  = (close_fn) dlsym(RTLD_NEXT, SYM_CLOSE);
 	return_fn real_return = (return_fn)dlsym(RTLD_NEXT, SYM_RETURN);
 	if (!real_gif || !real_open || !real_close || !real_return) return NULL;
-	for (int i = 0; i < 40 && !(g_sunxi_self && g_w > 0); i++) sleep(1);
-	sleep(8);                            // let camera_streamer's boot burst finish
+	for (int i = 0; i < 60 && !(g_sunxi_self && g_w > 0); i++) sleep(1);
 	uint8_t imgframe[64];
+	int held = 0, miss = 0;
 	while (1) {
 		void *self = g_sunxi_self;
-		// Yield the camera while cleaning: the ToF path (video1) is streaming and
-		// ava is using the same SunxiCam, so don't touch RGB then.
-		if (!self || g_w <= 0 || (now_ns() - g_last_ir_ns) < 2000000000ull) { sleep(1); continue; }
-		if (!g_shm) camtap_init_shm();
-		real_open(self, g_a1, g_fourcc, g_a3, g_w, g_h);
-		if (g_shm) g_shm->forced++;
-		int miss = 0;
-		while ((now_ns() - g_last_ir_ns) >= 2000000000ull) {   // until cleaning starts
-			memset(imgframe, 0, sizeof imgframe);
-			if (real_gif(self, imgframe) == 1) {
-				camtap_publish(*(void **)((char *)imgframe + IMAGEFRAME_DATA_OFF), g_w, g_h);
-				real_return(self, imgframe);   // re-queue the buffer (qbuf) -> keep streaming
-				miss = 0;
-			} else if (++miss > 20) break;     // truly stalled -> re-open
-			usleep(55000);                     // ~18 fps
+		if (!self || g_w <= 0) { sleep(1); continue; }
+		pthread_mutex_lock(&g_cam_lock);
+		if (cs_busy()) {                        // ava wants/uses the camera -> get off it
+			if (held && g_owner == OWN_DRIVE) { real_close(self); g_owner = OWN_NONE; }
+			held = 0; miss = 0;
+			pthread_mutex_unlock(&g_cam_lock);
+			usleep(150000);
+			continue;
 		}
-		real_close(self);
-		usleep(40000);
+		if (!held) {                            // acquire only if free
+			if (g_owner != OWN_NONE) { pthread_mutex_unlock(&g_cam_lock); usleep(150000); continue; }
+			real_open(self, g_a1, g_fourcc, g_a3, g_w, g_h);
+			g_owner = OWN_DRIVE; held = 1; miss = 0;
+			if (g_shm) g_shm->forced++;
+		}
+		memset(imgframe, 0, sizeof imgframe);   // one frame, still under the lock
+		int r = real_gif(self, imgframe);
+		if (r == 1) {
+			camtap_publish(*(void **)((char *)imgframe + IMAGEFRAME_DATA_OFF), g_w, g_h);
+			real_return(self, imgframe);        // qbuf -> keep the stream flowing
+			miss = 0;
+		} else if (++miss > 15) {               // stalled -> release, re-acquire fresh
+			real_close(self); g_owner = OWN_NONE; held = 0; miss = 0;
+		}
+		pthread_mutex_unlock(&g_cam_lock);
+		usleep(r == 1 ? 55000 : 120000);        // ~18 fps
 	}
 	return NULL;
 }
@@ -383,25 +426,22 @@ int _ZN9sunxi_cam8SunxiCam13GetImageFrameEPNS_10ImageFrameE(void *self, void *fr
 	if (!real) real = (frame_fn)dlsym(RTLD_NEXT, SYM_FRAME);
 	camtap_cfg();
 	g_sunxi_self = self;
+	g_cs_active_ns = now_ns();                 // ava is polling the camera
 	maybe_start_bg();
 	if (!g_shm) camtap_init_shm();
-	if (g_shm) g_shm->calls++;                 // every hook entry (diagnostic)
-	// record SunxiCam state each call (diagnostic), and force-start if configured
-	if (self && g_shm) {
-		g_shm->sunxi_state = (uint32_t)(*(volatile int *)((char *)self + SUNXI_STATE_OFF));
-		g_shm->sunxi_ctx = (*(void **)((char *)self + SUNXI_CTX_OFF)) ? 1 : 0;
-	}
+	if (g_shm) g_shm->calls++;
+	// serialize with the drive thread so the two never touch SunxiCam at once
+	pthread_mutex_lock(&g_cam_lock);
 	int r = real ? real(self, frame) : 0;
+	pthread_mutex_unlock(&g_cam_lock);
 	if (r == 1) {
-		if (g_shm) g_shm->okframes++;          // real delivered a frame
-		if (frame && g_w > 0 && g_h > 0) {
-			g_seen++;
-			const void *data = (g_mode == MODE_COPY)
-				? *(void **)((char *)frame + IMAGEFRAME_DATA_OFF) : NULL;
-			camtap_publish(data, g_w, g_h);
-		}
-	} else {
-		maybe_force_start(self);               // no frame -> try to kick streaming
+		if (g_shm) g_shm->okframes++;
+		// legacy: when explicitly in copy mode (no drive thread) publish ava's own
+		// frames; with FORCE=5 the drive thread owns RGB and this stays idle.
+		if (g_force < 4 && g_mode == MODE_COPY && frame && g_w > 0 && g_h > 0)
+			camtap_publish(*(void **)((char *)frame + IMAGEFRAME_DATA_OFF), g_w, g_h);
+	} else if (g_force < 4) {
+		maybe_force_start(self);
 	}
 	return r;
 }
