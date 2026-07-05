@@ -1,7 +1,22 @@
 # Phase 2 — streaming during cleaning (Source B)
 
-**Status: fully reverse-engineered and implemented; deployable. The one part to confirm on real
-hardware is the CedarX H264 parameter tuning (frame tap + NV21 layout are verified).**
+> ## ⚠️ Result: NOT recommended on this hardware
+>
+> This was fully reverse-engineered, built, and **tested on the real robot**. The frame tap itself is
+> verified correct (see below). **But** with the tap active, starting a cleaning job triggers
+> continuous kernel ISP faults (`isp0 frame error, size 0` / `sunxi_isp_reset`), no frames reach
+> either our relay **or** `ava` — the robot navigates **blind**. Removing the tap and repeating the
+> same cleaning on stock `ava` produces zero errors. Copying the full 508 KB frame inside `ava`'s
+> capture thread perturbs the VIN/ISP buffer timing enough to fault the ISP during sustained capture.
+>
+> No reboot occurs (unlike a second camera open), but blinding navigation is unacceptable, so **this
+> is kept as a documented research result, not a shippable feature.** Use Phase 1 for reliable dock
+> viewing. A safe Phase 2 would need a zero-copy (physical/ION buffer) path — see the end of this file
+> and [`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md#on-device-test-result-important--the-tap-as-implemented-is-not-safe-during-cleaning).
+
+**What was verified as correct:** the hook interposes `sunxi_cam::SunxiCam::GetImageFrame`; the shm
+header decoded exactly on-device (`672x504`, size `508032 = 672*504*3/2`, NV21). The mechanism below is
+sound; the problem is the cost of the copy in the capture thread, not the plumbing.
 
 Phase 1 streams from the dock and gets out of the camera's way during cleaning. Phase 2 fills the gap
 **without a second camera open** (which reboots the W10), by tapping the frames `ava` already captures.
@@ -75,9 +90,22 @@ Then start a cleaning job and, on the robot, verify frames are flowing:
 Once `--stats` shows frames, the supervisor uses `ava_cam_relay` as Source B automatically while
 cleaning.
 
-## The remaining unknown
+## Why it's not shippable, and what a safe version would need
 
-The frame tap and NV21 layout are verified by disassembly. The CedarX H264 **parameter indices**
-(bitrate/framerate/GOP in `VideoEncSetParameter`) are the standard Allwinner enum values but weren't
-confirmed against this exact BSP — if the H264 output is malformed, that's the first place to look
-(`src/vencoder.h`). `--stats` mode isolates the tap from the encoder so you can bisect quickly.
+The blocker is **not** the encoder or the plumbing — it is the CPU copy in `ava`'s capture thread
+faulting the ISP during cleaning (see the warning at the top). A safe Phase 2 must avoid touching the
+frame with the CPU inside `ava`:
+
+- **Zero-copy tap.** In the `GetImageFrame` hook, write only ~32 bytes of metadata to shm: the ISP
+  buffer's physical/ION address (`ImageFrame+0x18`), dimensions, and a sequence number — no `memcpy`.
+  The relay's CedarX encoder then DMA-imports that physical buffer directly (CedarX can encode from an
+  ION/physical address). This removes both the latency and the cache eviction from the capture thread.
+  It is fragile: `ava` requeues the buffer to the ISP right after `GetImageFrame` returns, so the
+  encoder must import+consume it within the frame window or risk tearing. Not attempted on the owner's
+  working robot.
+- **Separate VIN scaler.** The SoC has 4 scalers; in principle a second read-only stream could be
+  pulled without reconfiguring the sensor. Also unproven and risky (a naive second open reboots).
+
+If someone does finish the encoder path, note the CedarX H264 **parameter indices**
+(bitrate/framerate/GOP in `VideoEncSetParameter`, `src/vencoder.h`) are standard Allwinner enum values
+not confirmed against this exact BSP. `--stats` mode isolates the tap from the encoder for bisecting.

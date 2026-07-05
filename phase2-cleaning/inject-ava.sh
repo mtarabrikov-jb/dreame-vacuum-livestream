@@ -19,7 +19,11 @@
 # ===========================================================================
 set -u
 DIR="${REMOTE_DIR:-/data/camstream}"
-REAL="$DIR/ava.real"
+# The real ava copy MUST keep basename "ava" so its process comm stays "ava" —
+# otherwise ava.sh's `killall -9 ava` and sys_monitor's `pidof ava` miss it and
+# spawn a duplicate. Hence a dir, not "ava.real".
+REALDIR="$DIR/ava_real"
+REAL="$REALDIR/ava"
 WRAP="$DIR/ava.wrap"
 POSTBOOT=/data/_root_postboot.sh
 BEGIN='# >>> camstream-phase2 >>>'
@@ -31,6 +35,7 @@ tap_active() { p=$(ava_pid); [ -n "$p" ] && grep -q libcamtap "/proc/$p/maps" 2>
 make_wrapper() {
 	# snapshot the real ava ONCE, before any bind mount can hide it
 	if ! grep -q ' /usr/bin/ava ' /proc/mounts && [ ! -f "$REAL" ]; then
+		mkdir -p "$REALDIR"
 		cp -a /usr/bin/ava "$REAL"
 	fi
 	cat > "$WRAP" <<EOF

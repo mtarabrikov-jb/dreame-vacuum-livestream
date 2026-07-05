@@ -106,6 +106,29 @@ The tap runs inside `ava` and must be minimal and defensive — it does a single
 into a tmpfs seqlock buffer (`/tmp/camtap.shm`) and returns. All encoding/network happens in a
 separate process (`ava_cam_relay`) so a bug there can never crash navigation.
 
+### On-device test result (important — the tap as implemented is NOT safe during cleaning)
+
+Verified end to end on the real robot:
+
+- **The hook works.** At ava startup the tap captured 55 real frames; the shm header decoded exactly:
+  magic `CMPT`, `672x504`, size `0x7C080 = 508032 = 672*504*3/2` — NV21 confirmed, dimensions and
+  layout all correct. LD_PRELOAD interposition of the dlopen'd plugin's cross-`.so` call works.
+- **But during *cleaning* it breaks capture.** With the tap active, starting a cleaning job produced
+  **continuous kernel ISP faults** (`[VIN_ERR] isp0 frame error, size 0`, `sunxi_isp_reset: ISP frame
+  number is 0`, `8856 pd io`), the frame counter never advanced past the 55 startup frames, and
+  `ava` got **no** frames either — i.e. the robot was navigating blind. Removing the tap and repeating
+  the exact same cleaning on stock `ava` produced **zero** ISP errors and normal capture.
+- **Conclusion:** copying the full 508 KB frame inside `ava`'s capture thread perturbs the tight
+  VIN/ISP buffer timing (added latency + L2 cache eviction every frame) enough to fault the ISP during
+  continuous cleaning capture. The brief docked startup burst tolerates it; sustained cleaning capture
+  does not. No reboot occurred (unlike a second camera open), but blinding navigation is unacceptable.
+
+So the full-copy in-ava tap is a dead end for live cleaning on this SoC. A viable Phase 2 would need a
+**zero-copy** path: the hook writes only tiny metadata (the ISP buffer's physical/ION address at
+`ImageFrame+0x18`, dims, seq) and the encoder DMA-imports that buffer directly — no CPU copy, no cache
+pollution in the capture thread. That is fragile (the buffer is requeued by `ava` right after) and was
+not pursued on the owner's working robot. Phase 1 (dock viewing) remains the reliable path.
+
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 
 `ava_cam_relay` encodes the tapped NV21 with the SoC's hardware encoder. `/usr/lib/libvencoder.so` is

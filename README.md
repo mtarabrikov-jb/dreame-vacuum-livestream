@@ -42,11 +42,12 @@ there is **no conflict and no reboot**.
 | Phase | What it does | State |
 |-------|--------------|-------|
 | **Phase 1** — supervisor + Source A | Safe base viewing. Auto‑starts `video_monitor` on the dock, **auto‑kills it before cleaning** so the robot never reboots. | ✅ **Working** (`make` targets below) |
-| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ✅ **Implemented & builds for aarch64**; opt‑in (restarts `ava`). H264 param tuning to confirm on‑device — see [`phase2-cleaning/README.md`](phase2-cleaning/README.md) |
+| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ⚠️ **Researched, built, and tested — NOT recommended.** The full-frame copy inside `ava` destabilizes the ISP during cleaning (navigation goes blind). See the on-device result in [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
 
-With Phase 1 alone you get a **safe, automatic** stream from the dock that gets out of the way during
-cleaning. Phase 2 adds live viewing **during** cleaning by tapping the frames `ava` already captures —
-fully reverse‑engineered and built; enabling it injects a tap into `ava` (opt‑in, restarts `ava`).
+**Use Phase 1.** It gives a safe, automatic stream from the dock that gets out of the way during
+cleaning. Phase 2 was fully reverse-engineered and implemented, but on-device testing showed the
+in-`ava` frame tap perturbs the camera pipeline during cleaning — it is kept as a documented research
+result, not a recommended feature.
 
 ---
 
