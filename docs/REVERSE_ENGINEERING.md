@@ -169,9 +169,26 @@ single-ISP contention; the earlier "one ISP" reading was wrong):
   video_monitor remote-view path used by Phase 1). Conclusion is unchanged: no live RGB view while the
   robot is operating.
 - `/dev/video1` = the **ToF / depth sensor** path. It **does** stream during cleaning: `dqbuf[1]` climbed
-  0→167 in ~26 s (~8 fps). But its `S_FMT` is `224x1558`, fourcc **`BG12`** (12-bit Bayer/raw),
-  sizeimage `698368` — i.e. **raw ToF sensor data** (a tall stack of phase sub-frames), not a viewable
-  image. Turning it into even a coarse depth map needs the proprietary ToF reconstruction pipeline.
+  0→167 in ~26 s (~8 fps). Its `S_FMT` is `224x1558`, fourcc **`BG12`** (12-bit, `698368` bytes/frame).
+
+### video1 IS viewable — it is an infrared image (Phase 2 reopened)
+
+Grabbing a real `video1` frame (self-`mmap` of the dequeued plane in the `ioctl` hook) and decoding it
+showed the `224x1558` frame is **9 infrared sub-frames of `224x173` stacked vertically** (row
+autocorrelation gives a clean 173-row period; the first sub-frame is a dark reference). Each sub-frame
+is a **recognizable grayscale IR image** of the room from the robot's floor-level view — furniture
+legs, a stool, floor, walls — essentially night vision. It is exactly what the robot navigates by, and
+it streams the whole time it cleans.
+
+**So a live "watch during cleaning" feed IS achievable — as infrared, not RGB color.** Pipeline:
+1. Tap `/dev/video1` in ava (`ioctl`/`VIDIOC_DQBUF` hook + self-mmap the plane) — **built** (this is how
+   the frame was captured).
+2. Unstack the 173-row bands; take the sharpest sub-frame, or max-project several for more detail.
+3. Flat-field (subtract the per-column fixed-pattern stripes) + contrast-stretch to 8-bit grayscale.
+4. Encode the gray as H264 (CedarX, chroma=128) or MJPEG → `:6969` → go2rtc (RTSP/WebRTC, like Phase 1).
+
+Only step 4 (encode) remains. Caveats: grayscale IR, ~224×173, ~8 fps — the RGB camera still cannot
+stream while cleaning (proven three ways above). But this is a genuine live view of the robot cleaning.
 
 **Final conclusion: you cannot watch a normal video of the cleaning on the W10.** The only thing that
 streams while cleaning is raw ToF/depth data (`video1`, not a picture); the watchable RGB camera

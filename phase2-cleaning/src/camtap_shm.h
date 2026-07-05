@@ -43,7 +43,11 @@ struct camtap_shm {
 	volatile uint64_t streamer; // 384  found AvaNodeCameraStreamer 'this' (0 = not found)
 	volatile uint32_t sw_before;// 392  value of streamer+0xa4 before we set it
 	volatile uint32_t sw_hits;  // 396  times we wrote the AI-camera switch = 3
-	uint8_t  data[CAMTAP_MAX_FRAME]; // 400
+	volatile uint32_t grab_used;// 400  grabbed plane bytesused
+	volatile uint32_t grab_len; // 404  grabbed plane length
+	volatile uint32_t grab_off; // 408  grabbed plane mem_offset
+	volatile uint32_t grab_dev; // 412  which /dev/videoN was grabbed (1=video1)
+	uint8_t  data[CAMTAP_MAX_FRAME]; // 416
 };
 
 #endif

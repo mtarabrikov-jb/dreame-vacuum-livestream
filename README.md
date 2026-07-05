@@ -42,12 +42,12 @@ there is **no conflict and no reboot**.
 | Phase | What it does | State |
 |-------|--------------|-------|
 | **Phase 1** — supervisor + Source A | Safe base viewing. Auto‑starts `video_monitor` on the dock, **auto‑kills it before cleaning** so the robot never reboots. | ✅ **Working** (`make` targets below) |
-| **Phase 2** — Source B (cleaning) | `LD_PRELOAD` tap in `ava` (`sunxi_cam::SunxiCam::GetImageFrame`) → tmpfs → CedarX H264 → go2rtc. | ⛔ **Not achievable on the W10 (hardware limit).** The RGB camera does not stream during cleaning — the single ISP is dedicated to the ToF obstacle sensor. Proven by passive tap and active force; see [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
+| **Phase 2** — Source B (cleaning) | Tap `/dev/video1` (ToF sensor) in `ava` → unstack IR sub-frame → grayscale → encode → go2rtc. | 🟡 **Achievable as an infrared feed.** RGB won't stream while cleaning, but the ToF sensor's stream decodes to a viewable night-vision image (`224×173`, ~8 fps). Tap + decode proven; only the encode step remains. See [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
 
-**Use Phase 1.** It gives a safe, automatic stream from the dock that gets out of the way during
-cleaning. Phase 2 was fully reverse-engineered, built, and tested on the robot; the tap/encoder/build
-are all correct, but the W10 simply doesn't run its RGB camera while cleaning (the one ISP belongs to
-the ToF obstacle sensor then), so there is nothing to stream. Kept as a documented dead end.
+Phase 1 gives a full-color stream from the dock. Phase 2 turned out to be possible after all — **not**
+as the RGB camera (that stays off while cleaning, proven three ways), but via the robot's ToF/depth
+sensor, whose raw `224×1558 BG12` stream decodes into a clean **infrared** image of the room from the
+robot's point of view. See the reverse-engineering notes for the captured frame and the pipeline.
 
 ---
 

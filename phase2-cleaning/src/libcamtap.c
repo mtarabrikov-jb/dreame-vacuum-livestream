@@ -53,7 +53,8 @@ enum { MODE_COPY = 0, MODE_META = 1 };
 
 static int g_w = 0, g_h = 0;
 static struct camtap_shm *g_shm = NULL;
-static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0, g_force = 0;
+static int g_mode = MODE_COPY, g_every = 1, g_yonly = 0, g_force = 0, g_grab = 0;
+static int g_grabbed = 0;
 static int g_cfg = 0;
 static unsigned long long g_seen = 0;
 // saved OpenCamera args, so we can call SunxiCam::start with the same params
@@ -68,6 +69,7 @@ static void camtap_cfg(void) {
 	const char *e = getenv("CAMTAP_EVERY"); if (e && atoi(e) > 0) g_every = atoi(e);
 	const char *y = getenv("CAMTAP_YONLY"); if (y) g_yonly = atoi(y);
 	const char *f = getenv("CAMTAP_FORCE"); if (f) g_force = atoi(f);
+	const char *g = getenv("CAMTAP_GRAB"); if (g) g_grab = atoi(g);
 }
 
 static void camtap_init_shm(void) {
@@ -146,6 +148,27 @@ int ioctl(int fd, unsigned long req, void *arg) {
 			if (v >= 0 && v < 4) {
 				g_shm->dqbuf[v]++;
 				g_shm->dqbytes[v] = *(uint32_t *)((char *)arg + 8); // bytesused
+				// grab one raw multiplanar frame from the requested device
+				if (g_grab && !g_grabbed && v == g_grab) {
+					// v4l2_buffer (mplane): m.planes @ +64; plane: bytesused@0, length@4, mem_offset@8
+					void *planes = *(void **)((char *)arg + 64);
+					if (planes) {
+						uint32_t used = *(uint32_t *)((char *)planes + 0);
+						uint32_t len  = *(uint32_t *)((char *)planes + 4);
+						uint32_t moff = *(uint32_t *)((char *)planes + 8);
+						uint32_t cap  = len ? len : used;
+						if (cap > 0 && cap <= CAMTAP_MAX_FRAME) {
+							void *m = mmap(NULL, cap, PROT_READ, MAP_SHARED, fd, (off_t)moff);
+							if (m != MAP_FAILED) {
+								memcpy(g_shm->data, m, cap);
+								munmap(m, cap);
+								g_shm->grab_used = used; g_shm->grab_len = len;
+								g_shm->grab_off = moff;  g_shm->grab_dev = (uint32_t)v;
+								g_grabbed = 1;
+							}
+						}
+					}
+				}
 			}
 		} else if (nr == 5 || nr == 4) {             // VIDIOC_S_FMT / G_FMT
 			int v = fd_videonum(fd);
