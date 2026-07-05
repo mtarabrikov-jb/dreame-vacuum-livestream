@@ -1,53 +1,48 @@
 # dreame-vacuum-livestream
 
-Live camera streaming from a **rooted Dreame Bot W10 (`r2104`)** robot vacuum, that works
-**both on the dock and during cleaning**, without breaking the robot's AI navigation.
+Live camera from a **rooted Dreame Bot W10 (`r2104`)** robot vacuum, served through the robot's own
+[go2rtc](https://github.com/AlexxIT/go2rtc) as **RTSP / WebRTC / MSE** (watch in a browser, VLC, or
+Home Assistant). One stream whose content **auto-switches with the robot's state**:
 
-The stream is exposed as **RTSP / WebRTC / MSE** via [go2rtc](https://github.com/AlexxIT/go2rtc),
-so you can watch it in a browser, VLC, or Home Assistant.
+| Robot state     | Feed | Source |
+|-----------------|------|--------|
+| **on the dock** | **full-color RGB** (the room from floor level) | the OV8856 camera, driven from inside `ava` |
+| **cleaning**    | **grayscale infrared** (night-vision) | the ToF/depth sensor `ava` uses to see obstacles |
 
-> **Model note.** Everything here was reverse‑engineered on and tested against the **Dreame W10,
-> product code `r2104`, SoC Allwinner `MR813`, sensor `OV8856`**. Other Dreame models use similar
-> but not identical internals — see [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)
-> before assuming it ports.
+> **Model note.** Reverse-engineered on and tested against the **Dreame W10, `r2104`, SoC Allwinner
+> `MR813`**. Other Dreame models share the stack but differ in details — see
+> [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md) before assuming it ports.
 
 ---
 
-## Why this exists
+## How it works
 
-The obvious approach — [tihmstar/vacuumstreamer](https://github.com/tihmstar/vacuumstreamer) — runs a
-stand‑alone `video_monitor` binary that **opens the camera directly** (`/dev/video0`). That works on
-the L10s Ultra (`r2228`), and it works on the W10 **while the robot is idle**. But the W10 has a
-**single physical camera** that the robot also needs for AI obstacle avoidance while cleaning.
+It's a single `LD_PRELOAD` shim (`libcamtap.so`) injected into `ava` (the robot's brain) plus a small
+out-of-process relay — no cloud, no `video_monitor`, no second camera open:
 
-If `video_monitor` holds the camera while the robot starts cleaning, the two capture paths fight over
-the same sensor and **the robot reboots** (observed, reproducible — see the RE notes). So a naive
-"just leave it running" setup is unsafe.
+- **On the dock** a background thread in the shim drives the RGB camera itself via the exported
+  `sunxi_cam::SunxiCam` API (`OpenCamera` → `GetImageFrame` + `ReturnImageFrame` at ~14 fps) and copies
+  each NV21 frame to a tmpfs buffer. It **yields the camera the moment cleaning starts**, so it never
+  fights the robot's own use of it.
+- **While cleaning** the shim taps the ToF sensor's stream (`/dev/video1`) that `ava` is already
+  running for obstacle avoidance — the raw `224×1558` frame decodes into a clean infrared image.
+- The **relay** reads whichever frame is in the buffer, encodes it to JPEG (a self-contained baseline
+  encoder: color 4:2:0 for RGB, grayscale for IR), and serves MJPEG on loopback `:8090`. The robot's
+  **existing go2rtc** consumes that and re-serves it to you.
 
-This project solves that with **two sources and a supervisor that switches between them**:
-
-| Robot state        | Source                                        | Camera owner |
-|--------------------|-----------------------------------------------|--------------|
-| docked / idle      | **A:** `video_monitor` opens the camera       | `video_monitor` |
-| cleaning / moving  | **B:** a tiny `LD_PRELOAD` tap inside `ava` copies the frames `ava` already captures | `ava` (robot) |
-
-Because during cleaning we **don't open the camera a second time** — we tap the frames `ava` is
-already producing for its AI node (by interposing `sunxi_cam::SunxiCam::GetImageFrame` inside `ava`) —
-there is **no conflict and no reboot**.
+The RGB camera being off during cleaning, and the ToF stream being the only live feed then, are both
+covered in the RE notes — as is why the vendor's `video_monitor` path can't be used (it waits for a
+cloud "start" command the de-clouded robot never sends).
 
 ---
 
 ## Status
 
-| Phase | What it does | State |
-|-------|--------------|-------|
-| **Phase 1** — supervisor + Source A | Safe base viewing. Auto‑starts `video_monitor` on the dock, **auto‑kills it before cleaning** so the robot never reboots. | ✅ **Working** (`make` targets below) |
-| **Phase 2** — Source B (cleaning) | Tap `/dev/video1` (ToF sensor) in `ava` → unstack IR sub-frame → grayscale → encode → go2rtc. | 🟡 **Achievable as an infrared feed.** RGB won't stream while cleaning, but the ToF sensor's stream decodes to a viewable night-vision image (`224×173`, ~8 fps). Tap + decode proven; only the encode step remains. See [`phase2-cleaning/README.md`](phase2-cleaning/README.md). |
-
-Phase 1 gives a full-color stream from the dock. Phase 2 turned out to be possible after all — **not**
-as the RGB camera (that stays off while cleaning, proven three ways), but via the robot's ToF/depth
-sensor, whose raw `224×1558 BG12` stream decodes into a clean **infrared** image of the room from the
-robot's point of view. See the reverse-engineering notes for the captured frame and the pipeline.
+**Working end-to-end**, verified live on the robot: a color kitchen frame on the dock and an infrared
+frame while cleaning, both pulled from go2rtc's `api/frame.jpeg`. Deploy with `make build → upload →
+install-phase2`, then `make watch` for the URLs. (A separate, now-superseded Phase 1 that used
+`video_monitor` for the dock view is kept in the tree but not needed — `video_monitor` idles without
+a cloud trigger on a de-clouded robot.)
 
 ---
 
