@@ -91,7 +91,8 @@ Then open **`http://<robot-ip>:1984/`** (go2rtc web UI, stream `camera`) or poin
 infrared. `make uninstall` restores stock `ava`.
 
 See [`docs/INSTALL.md`](docs/INSTALL.md) for the step‑by‑step walkthrough,
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design, and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) if the stream is dead (e.g. the camera stops mid-clean), and
 [`Makefile`](Makefile) (`make help`) for every target.
 
 ---
