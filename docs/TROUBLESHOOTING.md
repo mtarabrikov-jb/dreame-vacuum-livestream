@@ -5,7 +5,7 @@
 ### Symptom
 
 - The livestream freezes: go2rtc serves only the last frame from the moment it broke (a still image, not black), or nothing.
-- `/tmp/camtap.shm` stops advancing (the tap has no frames to copy).
+- The tap stops publishing frames: the `seq` / `frames` counters in the `/tmp/camtap.shm` header stop advancing (see the liveness check below). **Do not use the file's mtime** — the tap writes the frame through an `mmap`, which does not update mtime, so mtime stays at the file's creation time whether or not frames are flowing.
 - `dmesg` floods with, continuously:
   ```
   [VIN_ERR]isp0 frame error, size 0 1203, hblank max 1271 min 79x!!
@@ -37,9 +37,12 @@ Run over SSH (`root@<robot-ip>`). This is what pins it to the cable rather than 
    dmesg | grep -c VIN_ERR ; dmesg | tail -3 ; cut -d. -f1 /proc/uptime
    ```
 
-2. **When did frames stop?** `/tmp/camtap.shm` mtime is the last good frame (only advances while a feed is active — RGB on the dock, IR while cleaning):
+2. **Are frames flowing right now?** Read the tap's seqlock header twice, a few seconds apart. The `seq` field (offset 4) bumps `+2` per published frame and `frames` (offset 24) counts them; if either advances, live frames are reaching the tap. **Do not use mtime** — the tap writes via `mmap`, so mtime never moves per frame. On the dock the RGB feed only runs while a consumer is connected, so hold a viewer (or grab a go2rtc frame) while sampling:
    ```sh
-   ls -la /tmp/camtap.shm ; date
+   # header: u32 magic, u32 seq, u32 width, u32 height (little-endian)
+   dd if=/tmp/camtap.shm bs=32 count=1 2>/dev/null | od -An -tx4 ; sleep 4
+   dd if=/tmp/camtap.shm bs=32 count=1 2>/dev/null | od -An -tx4
+   # seq advancing (e.g. ~+120/4s = ~15fps) = camera live; frozen = no frames
    ```
 
 3. **Is the sensor alive on I2C?** OV8856 sits at bus 3, address 0x36. `UU` = claimed by the driver; read the chip-ID high byte (16-bit register, so use `i2ctransfer`):
@@ -63,7 +66,7 @@ If the camera is healthy but the stream is still down, the fault is downstream: 
 ```sh
 REMOTE_DIR=/data/camstream sh /data/camstream/run_ir.sh
 ```
-If `/tmp/camtap.shm` still does not advance after that, the source (ava/sensor) is the problem, not the relay.
+If the `seq` counter (step 2) still does not advance after that, the source (ava/sensor) is the problem, not the relay.
 
 ### What was ruled out (2026-07-07)
 
@@ -73,7 +76,11 @@ If `/tmp/camtap.shm` still does not advance after that, the source (ava/sensor) 
 
 ### The fix
 
-Physical only. Power off, open the top cover, and **reseat the OV8856 camera FPC cable** at both ends (camera module and mainboard); inspect it for a crease/crack. Re-test with the diagnostic above — `dmesg | grep -c VIN_ERR` should stop growing and `/tmp/camtap.shm` should tick during a stream. If reseating does not fix it, replace the camera module (or, rarely, the mainboard MIPI connector).
+Physical only. Power off, open the top cover, and **reseat the OV8856 camera FPC cable** at both ends (camera module and mainboard); inspect it for a crease/crack. Re-test with the diagnostic above — `dmesg | grep -c VIN_ERR` should stop growing and the `seq` counter (step 2) should advance during a stream. If reseating does not fix it, replace the camera module (or, rarely, the mainboard MIPI connector).
+
+### Resolution (2026-07-07)
+
+Reseating the FPC cable (plus a reboot) **fixed it** — which confirms the diagnosis (marginal MIPI contact, not the sensor or software). Recovery signature: a short burst of `VIN_ERR` during boot-time sensor init (~first 30 s), then the flood stops and the stream runs clean — `seq` advancing at ~15 fps (`+~120` per 4 s), buffer content changing, `ava` back to normal CPU. Contrast the failure, where `VIN_ERR` floods continuously for as long as the camera is open. Because the root cause is a marginal contact, it can recur under cleaning vibration.
 
 ### Optional mitigation until repaired
 
