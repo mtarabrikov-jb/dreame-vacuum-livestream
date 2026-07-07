@@ -92,3 +92,41 @@ Until the cable is fixed, every cleaning makes `ava` burn a core retrying the de
 - OV8856 chip-ID: `0x300B = 0x88`, `0x300C = 0x56` (datasheet).
 - VIN pipeline: `sunxi_mipi -> sunxi_csi -> sunxi_isp -> sunxi_scaler.0..3`; nodes `/dev/video0..2`. `ava` uses `/dev/video2` (cleaning), `video_monitor` uses `/dev/video0` (dock) — same physical OV8856.
 - Feed switch: dock = RGB, cleaning = grayscale IR (see README) — both fail together on an OV8856/link fault.
+
+## No video in Home Assistant over RTSP (the stream is MJPEG, not H264)
+
+### Symptom
+
+`rtsp://<robot-ip>:8554/camera` shows nothing in Home Assistant, while the exact same stream plays fine in the go2rtc web UI (`http://<robot-ip>:1984/`), VLC, or `ffplay`.
+
+### Cause
+
+The `camera` stream is **MJPEG only**. `ava_cam_relay` serves MJPEG on `127.0.0.1:8090` (YCbCr JPEG for both feeds — see [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) §10), go2rtc re-serves it; there is **no H264 producer**, and there is **no `ffmpeg` on the robot** to transcode. Confirm:
+
+```sh
+wget -qO- "http://127.0.0.1:1984/api/streams?src=camera"   # -> codec_name: "mjpeg", format_name: "mpjpeg"
+command -v ffmpeg || echo "no ffmpeg on robot"
+```
+
+Home Assistant's `stream` component (RTSP, recording, HLS) decodes **H264/H265 only** and does not handle MJPEG-over-RTSP, so HA pulls the stream but shows no picture. The go2rtc web UI works because MSE / WebRTC / MJPEG-over-HTTP all handle MJPEG.
+
+### Fixes
+
+1. **MJPEG camera in HA (simplest, live view only).** Skip RTSP; point HA at the MJPEG-over-HTTP endpoint:
+   ```yaml
+   camera:
+     - platform: mjpeg
+       name: Vacuum Camera
+       mjpeg_url: http://<robot-ip>:1984/api/stream.mjpeg?src=camera
+       still_image_url: http://<robot-ip>:1984/api/frame.jpeg?src=camera
+   ```
+   No recording/history (that needs H264).
+
+2. **Transcode to H264 on the HA side (confirmed working, 2026-07-07).** HA ships go2rtc + ffmpeg (runs on the HA host, x86 — cheap); let it transcode while the robot stays MJPEG. In HA's go2rtc config:
+   ```yaml
+   streams:
+     vacuum: ffmpeg:http://<robot-ip>:1984/api/stream.mjpeg?src=camera#video=h264
+   ```
+   Then add the `vacuum` stream as a go2rtc/WebRTC camera. This restores RTSP / stream / recording in HA.
+
+3. **H264 on the robot (proper, more work).** Have `ava_cam_relay` emit H264 via the SoC CedarX encoder (`libvencoder.so`, see REVERSE_ENGINEERING §5a) so `rtsp://.../camera` natively offers H264 and HA consumes it directly over RTSP — no HA-side transcode.
