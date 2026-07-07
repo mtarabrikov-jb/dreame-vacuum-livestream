@@ -18,7 +18,7 @@ The OpenCamera args were read live from `ava`'s memory (`libcamtap` statics `g_a
 
 Env: `CAM_INDEX`(2) `CAM_W`(672) `CAM_H`(504) `CAM_A3`(15) `CAM_FOURCC`(NV21) `CAM_SHM`(/tmp/camtap.shm) `CAM_LIB`.
 
-## IR / ToF - in progress (one blocker left)
+## IR / ToF - working
 
 The cleaning-time IR feed is a **separate sensor**: `ofilm0092` (a structured-light ToF), not the OV8856. It has its own full VIN pipeline, parallel to the RGB one:
 
@@ -31,7 +31,7 @@ ToF:  ofilm0092(e1)-> mipi.0 -> csi.0 -> isp1(e44) -> scaler.1   -> /dev/video1
 
 ToF format (RE'd from `ofilm0092` subdev + a live cleaning): sensor mbus **`0x3011`, 224x1558** all the way down the path; `/dev/video1` output is **MPLANE, `BG12`** (12-bit Bayer, 224x1558, `size = 224*1558*2`). Raw, ISP-passthrough - not the ISP-processed NV21 the RGB path produces. `ir_process.h` (Phase 2) decodes this 224x1558 frame (nine IR sub-frames) to grayscale.
 
-Standalone bring-up **works**: enable the two disabled links + set every subdev pad to `224x1558/0x3011`, then `S_FMT BG12` + `REQBUFS` + `STREAMON` on `/dev/video1` all succeed:
+Recipe (verified on the robot, `ava` stopped, on the dock): enable the two disabled links, set every subdev pad on the path to `224x1558/0x3011`, then run `w10-cam` on `/dev/video1` with the ToF format. Like the RGB path it drives the sensor through **`libsunxicamera`**, not raw V4L2:
 
 ```sh
 media_link  /dev/media0 1  0 32 0 1          # ofilm0092 -> mipi.0
@@ -39,12 +39,17 @@ media_link  /dev/media0 26 1 44 0 1          # csi.0 -> isp1
 for sd in "7 0" "7 1" "5 0" "5 1" "11 0" "11 2" "14 0" "14 1"; do   # mipi.0/csi.0/isp1/scaler.1 pads
   subdev_setfmt /dev/v4l-subdev$(echo $sd|cut -d' ' -f1) $(echo $sd|cut -d' ' -f2) 224 1558 3011
 done
-v4l2probe /dev/video1 224 1558 BG12          # S_FMT/REQBUFS/STREAMON OK
+CAM_INDEX=1 CAM_W=224 CAM_H=1558 CAM_FOURCC=BG12 CAM_FRAMESZ=698368 CAM_FORMAT=100 \
+  CAM_SHM=/tmp/camtap.shm w10-cam            # 60 frames, 0 misses; full-content IR
 ```
 
-**The one blocker: no frames while docked.** `STREAMON` succeeds but `DQBUF` times out - the ToF sensor does not emit unless the robot is navigating. It is **not** gated by sensor exposure/gain (both unchanged, 0/16, during an active ToF stream). The `/dev/video1` node exposes `V4L2_CID_ILLUMINATORS_1/2` (0x00980925/6) but `S_CTRL` on them returns `EINVAL`. Most likely the IR laser/illuminator is **powered by the MCU** during navigation (typical on Dreame). Next step: tap `ava`'s MCU TX at navigation start and diff for a laser-power command (reuse the SangamIO/dreame-w10 MCU protocol + `avatap`).
+Result: ~12 fps, 0 misses, and the 698368-byte frame is full of real data (not empty/dark) - **on the dock, without navigation**. `ir_process.h` (Phase 2) decodes the 224x1558 raw frame (nine IR sub-frames, `CAM_FORMAT=100`) to grayscale.
 
-Gotcha found the hard way: with **mop pads attached** the robot wets them at the dock first and only *then* moves and powers the camera/ToF - short "start cleaning" tests looked like the ToF never activated. Detach the pads (vacuum mode) to bring the ToF up quickly.
+**The "illuminator/navigation trigger" was a red herring.** A raw `v4l2probe` `STREAMON` on `/dev/video1` returns *no* frames (DQBUF times out), which looked like the sensor only emits while navigating. But `w10-cam` (i.e. `libsunxicamera::SunxiCam::start`) gets frames immediately, docked - so the missing piece was the vendor library's full sensor **start sequence**, not the IR laser or motion. (Ruled out along the way: sensor exposure/gain - unchanged 0/16 during an active stream; the three exported output GPIOs 118/355/360 - constant `1/0/1` even when the ToF is live; the `V4L2_CID_ILLUMINATORS_1/2` controls - `S_CTRL` returns `EINVAL`.)
+
+Concurrency verified: RGB (`CAM_INDEX=2`) and ToF (`CAM_INDEX=1`) `w10-cam` run **at the same time**, both 60 frames / 0 misses, since they use separate ISPs (isp0 / isp1). To stream both at once, give each its own `CAM_SHM` + relay + go2rtc stream; the vendor's single-feed auto-switch (RGB docked / IR cleaning) uses one shm.
+
+Gotcha found the hard way: with **mop pads attached** the robot wets them at the dock first and only *then* moves - short "start cleaning" probes for the live ToF config looked like the ToF never activated. Detach the pads (vacuum mode) to bring the live ToF up quickly.
 
 ## Tools (`tools/`, aarch64 static)
 

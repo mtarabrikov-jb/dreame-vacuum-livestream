@@ -64,7 +64,11 @@ int main(void) {
     uint32_t fourcc = (fcc && strlen(fcc) >= 4)
         ? ((uint32_t)fcc[0] | (fcc[1] << 8) | (fcc[2] << 16) | ((uint32_t)fcc[3] << 24))
         : ((uint32_t)'N' | ('V' << 8) | ('2' << 16) | ((uint32_t)'1' << 24));   // "NV21"
-    size_t framesz = (size_t)W * H * 3 / 2;
+    // Frame size: NV21 default (W*H*3/2); override for raw formats (e.g. BG12 ToF
+    // is 16-bit -> W*H*2). CAM_FORMAT is the camtap.shm tag (0=NV21, 100=raw ToF).
+    size_t framesz = getenv("CAM_FRAMESZ") ? (size_t)strtoul(getenv("CAM_FRAMESZ"), NULL, 10)
+                                           : (size_t)W * H * 3 / 2;
+    uint32_t shmfmt = getenv("CAM_FORMAT") ? (uint32_t)atoi(getenv("CAM_FORMAT")) : 0;
 
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_sig;
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
@@ -83,7 +87,8 @@ int main(void) {
 
     // Our own SunxiCam object: {ctx_ptr@0, state@8}. 64 bytes zeroed is plenty.
     void *self = calloc(1, 64);
-    fprintf(stderr, "w10-cam: OpenCamera(/dev/video%d, NV21, a3=%d, %dx%d)\n", idx, a3, W, H);
+    fprintf(stderr, "w10-cam: OpenCamera(/dev/video%d, fourcc=%08x, a3=%d, %dx%d, framesz=%zu fmt=%u)\n",
+            idx, fourcc, a3, W, H, framesz, shmfmt);
     int r = Open(self, idx, (int)fourcc, a3, W, H);
     if (r != 1) { fprintf(stderr, "OpenCamera failed (ret=%d) - pipeline not up standalone?\n", r); return 2; }
     fprintf(stderr, "w10-cam: streaming; writing %zuB to %s\n", framesz, shmpath);
@@ -97,7 +102,7 @@ int main(void) {
         if (gr != 1 || !data) { misses++; usleep(5000); continue; }
 
         shm->seq++; __sync_synchronize();          // odd = write in progress
-        shm->width = (uint32_t)W; shm->height = (uint32_t)H; shm->format = 0; // NV21
+        shm->width = (uint32_t)W; shm->height = (uint32_t)H; shm->format = shmfmt;
         shm->size = (uint32_t)framesz; shm->ts_ns = now_ns();
         memcpy(shm->data, data, framesz);
         shm->frames++;
