@@ -1,6 +1,6 @@
 # Build the Phase 2 aarch64 artifacts for the robot:
 #   libcamtap.so    - LD_PRELOAD tap injected into ava (captures NV21 frames)
-#   ava_cam_relay   - out-of-ava process: shm -> H264 (CedarX) -> :6969
+#   ava_cam_relay   - out-of-ava process: shm -> MJPEG (software JPEG) -> :8090
 #
 # Toolchain: the aarch64 cross gcc (apt: gcc-aarch64-linux-gnu). Build inside the
 # pinned Docker image (`make docker`) for a reproducible result and to avoid
