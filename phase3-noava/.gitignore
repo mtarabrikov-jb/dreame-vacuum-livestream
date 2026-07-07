@@ -1,0 +1,7 @@
+src/w10-cam
+tools/media_topo
+tools/media_link
+tools/subdev_setfmt
+tools/subdev_probe
+tools/query_ctrl
+tools/v4l2probe

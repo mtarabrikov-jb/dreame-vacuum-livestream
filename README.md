@@ -92,7 +92,8 @@ infrared. `make uninstall` restores stock `ava`.
 
 See [`docs/INSTALL.md`](docs/INSTALL.md) for the step‑by‑step walkthrough,
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
-[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) if the stream is dead (e.g. the camera stops mid-clean), and
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) if the stream is dead (e.g. the camera stops mid-clean),
+[`phase3-noava/README.md`](phase3-noava/README.md) for running the camera **without `ava`** (full-autonomy setups), and
 [`Makefile`](Makefile) (`make help`) for every target.
 
 ---
