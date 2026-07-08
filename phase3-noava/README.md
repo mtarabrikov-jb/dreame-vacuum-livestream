@@ -76,3 +76,67 @@ Gotcha found the hard way: with **mop pads attached** the robot wets them at the
 ### Entity -> node map (r2104)
 
 `ofilm0092`=/dev/v4l-subdev0, `ov8856`=subdev1, `csi.0`=subdev5, `mipi.0`=subdev7, `isp0`=subdev9, `isp1`=subdev11, `scaler.0`=subdev13, `scaler.1`=subdev14. Video nodes: `video0/1/2` = vin_video0/1/2.
+
+---
+
+## ToF deep-dive: hardware, kernel path, raw-V4L2 capture, and the ava-contamination gotcha
+
+Everything below was reverse-engineered while making the ToF work standalone from a **raw-V4L2** capturer (ros2dreame's `w10-camd`), i.e. WITHOUT `libsunxicamera`/`w10-cam`. It also explains a long red herring where "the ToF only streams noise".
+
+### Hardware identity
+
+- **Module:** Sunny Optical **MTP-series iToF** (the `sunnytof.ko` kernel driver probes/detects `MTP007` / `MTP009` / `MTP009A` / `MTP012`, "sunny tof 9FPS", author `lwj`).
+- **Sensor node:** `ofilm0092` (O-Film module 0092), kernel driver `ofilm0092.ko`. Both `.ko` live in `/usr/lib/modules/4.9.191/external/`.
+- **Bus / pins (from device-tree `soc/vind@0/sensor@0`):** sensor on **`/dev/i2c-2` @ `0x3d`**; `sensor0_reset` = **PE9 = gpio-137**; **`sensor0_en` (the IR illuminator / power-en) = PD3 = gpio-99**; mclk 24 MHz; regulators `reg_aldo3`=1.8 V, `reg_cldo2`=1.8 V (IOVDD), `reg_cldo3`=3.3 V.
+- **Frame:** `/dev/video1`, **MPLANE `BG12`**, **224x1558** (mbus `0x3011`), `size = 224*1558*2 = 698368`. It is nine 224x173 IR sub-frames stacked; `ir_process.h` decodes them to a grayscale IR image (sub-frame 0 is a dark reference; max-project 1..8).
+
+### THE gotcha: `ava` must be 100% dead before opening the camera
+
+This is the single most important operational fact and the cause of the entire "ToF = noise" red herring. While `ava` is alive it holds `/dev/video1` **and** `/dev/video2` and keeps the **RGB pipeline (isp0)** running. If you open the camera while `ava` is up, the kernel logs:
+
+```
+[VIN_ERR]video1 open busy
+[VIN_ERR]isp0 frame error, size 0 1203, hblank max 1271 min ...!!
+[VIN]sunxi_isp_reset:isp0 reset!!!,ISP frame number is 0
+[VIN_ERR]****************8856 pd io  136 ,frame id 1
+```
+
+and your ToF frames come out as **pure noise** (and RGB never comes up). This is NOT a modulation/sync/VCSEL problem and NOT a "RGB only works idle / ToF only works while navigating" firmware policy - those were all wrong conclusions drawn from captures contaminated by a still-running `ava`. Kill it properly: freeze **both** watchdogs (`kill -STOP` on `sys_monitor.sh ava` and `rc.d/monitor.sh`), `killall ava`, wait until `pidof ava` is empty, then `killall -9 ava` as a backstop. With `ava` truly gone the exact same capture yields a clean structured-light IR image. (Tell noise from signal fast: a noise JPEG is ~75 KB - random data barely compresses; a real IR frame is ~30 KB.)
+
+### Kernel path (how power + illuminator + init actually happen)
+
+The base sensor bring-up is done **in the kernel** by `ofilm0092.ko` at `sensor_s_stream`, NOT in userspace - so a userspace i2c/`libsunxicamera` snoop never sees it. Raise the driver's own debug logging to watch it:
+
+```sh
+for v in vinc0 vinc1 vinc2; do echo 0xffffff7f > /sys/devices/platform/soc/2000800.vind/$v/vin_log_mask; done   # 0xffffff7f = all bits except VIN_LOG_VIDEO (0x80), which floods "Nobody is waiting on video1 buffer"
+dmesg -c; <start capture>; dmesg | grep -v "Nobody is waiting"
+```
+
+A clean ToF stream-on logs, in order:
+
+```
+[ofilm0092]PWR_ON!  -> set regulator reg_aldo3/cldo2=1.8V, reg_cldo3=3.3V
+mclk0 set rate 24000000
+[ofilm0092]gpio high            <- sensor0_en / gpio-99 : the IR illuminator on
+[ofilm0092]sensor_init / sensor detect! / rdval 0x6d 0x6d / $$$$ 0xb6,0x92,... / detect ofilm0092 tof!
+sensor_set_fmt 224*1558 0x3008 -> 0x3011
+sensor_s_stream on = 1, 224*1558 fps: 10 code: 3011
+video1 first frame!
+```
+
+The full base register table (`sensor_default_regs`, dozens of entries incl. values `0x5efb`/`0x573c`) lives in `ofilm0092.ko`'s `.data` and is written by the kernel over its own i2c client. The illuminator is just `gpio-99` driven high in `PWR_ON` - not a userspace-settable thing (`V4L2_CID_ILLUMINATORS_1/2` S_CTRL returns `EINVAL`; the DT gpio is claimed by the driver).
+
+### Raw-V4L2 capture recipe (no libsunxicamera) - what ros2dreame's `w10-camd` does
+
+`libsunxicamera::OpenCamera` is built for the RGB camera (isp0/ov8856); for the ToF, drive `/dev/video1` with plain V4L2 MPLANE, matching `ava`'s own `node_tof.so` call order (captured via an ioctl snoop):
+
+1. Set the ToF media pipeline once (links + pad formats), same as `noava-cam.sh tof_pipeline`: enable `media_link 1 0 32 0 1` (ofilm0092->mipi.0) and `26 1 44 0 1` (csi.0->isp1); `subdev_setfmt` pads `7/0 7/1 5/0 5/1 11/0 11/2 14/0 14/1` to `224 1558 3011`.
+2. `open("/dev/video1")` -> `VIDIOC_S_INPUT (input=0)` -> `VIDIOC_S_PARM (timeperframe 1/10)` -> `VIDIOC_S_FMT` (`V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE`, 224x1558, pixfmt `BG12`, `field=V4L2_FIELD_NONE`, 1 plane) -> `VIDIOC_REQBUFS` (4, MMAP) -> `QUERYBUF`+`mmap`+`QBUF`.
+3. Write the sensor "tweak" registers over `/dev/i2c-2` @ `0x3d` (I2C_RDWR, wire `[reg16 BE][val16 BE]`) - the exact 9 writes `ava` does post-init: `0x9002/04/06/08 = 0x5efb`, `0x900a/0c/0e/10 = 0x573c`, `0x9402 = 0x0001`. (These are on top of the kernel's base table; harmless to re-apply.)
+4. `VIDIOC_STREAMON` -> `VIDIOC_DQBUF` loop -> the mmap'd plane is the raw 224x1558 BG12 -> `ir_process.h` (`tof_to_gray` + `ir_upscale`) -> 448x346 grayscale.
+
+Verified end-to-end (ava OFF): clean structured-light IR at ~10 fps, 0 misses, delivered as `sensor_msgs/CompressedImage` on a ROS 2 topic.
+
+### Dead ends (do not re-investigate)
+
+MCU frames (replicated `ava`'s entire active MCU-tx incl. `SetCleaning 55 6e 50 00 03 00`), `SetCleaning` mode `0x03`, `0x1d 05 01` "laser enable" (`ava` sends it even docked with ToF off), sysfs/GPIO/regulator writes, `/dev/mem`, exposure/gain (`0/16` in both good and bad captures), the `V4L2_CID_ILLUMINATORS_1/2` controls, and a `STREAMON/STREAMOFF/STREAMON` double-cycle (this **hangs the VIN driver** - D-state + kernel oops, needs a reboot; do not do it). None of these were the lever - the lever was simply "is `ava` fully dead".
