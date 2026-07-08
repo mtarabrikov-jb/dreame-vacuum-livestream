@@ -13,7 +13,9 @@
 // the live feed of what the robot sees the whole time it cleans.
 //
 // Env: IR_PORT (8090), IR_BAND (-1=max-project, 0..8=one sub-frame),
-//      IR_SCALE (2), IR_QUALITY (80).   Also: --stats to just report the tap.
+//      IR_SCALE (2), IR_QUALITY (80), CAM_SHM (/tmp/camtap.shm — the shm to
+//      read; set a second path to run a second relay for the other camera).
+//      Also: --stats to just report the tap.
 // ---------------------------------------------------------------------------
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -38,8 +40,8 @@ static void on_sig(int s){ (void)s; g_stop = 1; }
 // and the main loop can notice g_stop and exit cleanly on SIGTERM.
 static void catch_sig(int sig){ struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=on_sig; sigaction(sig,&sa,NULL); }
 
-static struct camtap_shm *open_shm(void) {
-	int fd = open(CAMTAP_SHM_PATH, O_RDWR);
+static struct camtap_shm *open_shm(const char *path) {
+	int fd = open(path, O_RDWR);
 	if (fd < 0) return NULL;
 	void *p = mmap(NULL, sizeof(struct camtap_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	close(fd);
@@ -82,16 +84,17 @@ int main(int argc, char **argv) {
 	int scale = getenv("IR_SCALE")   ? atoi(getenv("IR_SCALE"))   : 2;
 	int port  = getenv("IR_PORT")    ? atoi(getenv("IR_PORT"))    : 8090;
 	int qual  = getenv("IR_QUALITY") ? atoi(getenv("IR_QUALITY")) : 80;
+	const char *shmpath = getenv("CAM_SHM"); if (!shmpath) shmpath = CAMTAP_SHM_PATH;
 	if (scale < 1) scale = 1; if (scale > 4) scale = 4;
 	catch_sig(SIGINT); catch_sig(SIGTERM); signal(SIGPIPE, SIG_IGN);
 
 	struct camtap_shm *shm = NULL;
-	for (int i = 0; i < 50 && !shm && !g_stop; i++) { shm = open_shm(); if (!shm) usleep(200000); }
+	for (int i = 0; i < 50 && !shm && !g_stop; i++) { shm = open_shm(shmpath); if (!shm) usleep(200000); }
 	if (!shm || shm->magic != CAMTAP_MAGIC) {
-		fprintf(stderr, "no %s (is libcamtap CAMTAP_IR=1 active and is it cleaning?)\n", CAMTAP_SHM_PATH);
+		fprintf(stderr, "no %s (is libcamtap CAMTAP_IR=1 active and is it cleaning?)\n", shmpath);
 		return 1;
 	}
-	fprintf(stderr, "attached to %s\n", CAMTAP_SHM_PATH);
+	fprintf(stderr, "attached to %s\n", shmpath);
 
 	static unsigned char frame[CAMTAP_MAX_FRAME];
 	static unsigned char gray[IR_SUB * TOF_W];

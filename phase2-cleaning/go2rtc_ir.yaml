@@ -1,8 +1,13 @@
-# go2rtc config for the Phase 2 camera feed.
-# The relay serves MJPEG on loopback :8090 (RGB color on the dock, infrared while
-# cleaning); go2rtc consumes it and re-serves. One stream, content auto-switches.
+# go2rtc config for the camera feed(s).
+# A relay serves MJPEG on loopback; go2rtc consumes it and re-serves as RTSP/MSE.
+#   camera    <- relay on :8090 (Phase 2: RGB on dock / IR while cleaning; or the
+#               single RGB feed in no-ava mode)
+#   camera_ir <- relay on :8091 (no-ava DUAL mode only: the second, IR/ToF feed;
+#               idle/unused otherwise -- go2rtc connects lazily, only on request)
+# Dual mode (noava-cam.sh start both): camera=RGB, camera_ir=IR/ToF, concurrently.
 streams:
   camera: "http://127.0.0.1:8090/stream"
+  camera_ir: "http://127.0.0.1:8091/stream"
 
 api:
   listen: ":1984"      # web UI + snapshot API (http://<ip>:1984/)

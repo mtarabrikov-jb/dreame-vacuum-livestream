@@ -4,6 +4,19 @@ Phase 2 taps the camera from *inside* a running `ava` so Valetudo/navigation kee
 
 Build: `make docker` (aarch64). Deploy the binaries next to the relay and run with `ava` stopped.
 
+## Running (`noava-cam.sh`)
+
+One wrapper brings the whole stack up (needs `ava` already stopped - use it via sangamio's `w10-direct.sh`, which freezes ava's watchdogs first):
+
+```sh
+noava-cam.sh start        # RGB only     -> go2rtc stream "camera"    (rtsp://<ip>:8554/camera)
+noava-cam.sh start tof    # IR/ToF only  -> go2rtc stream "camera"
+noava-cam.sh start both   # BOTH at once -> "camera" (RGB) + "camera_ir" (IR/ToF)
+noava-cam.sh stop | status
+```
+
+`both` runs two `w10-cam` + two `ava_cam_relay` (ports 8090/8091, one per `CAM_SHM`) into a single go2rtc serving both named streams. Or via the autonomy wrapper: `w10-direct.sh start both` (kills ava + runs sangamio + both cameras). HA over RTSP needs H264 transcode: `ffmpeg:http://<ip>:1984/api/stream.mjpeg?src=camera#video=h264` (and `...src=camera_ir...`).
+
 ## RGB - `src/w10-cam.c` (working)
 
 Standalone RGB capture. `dlopen`s the vendor `libsunxicamera.so` and calls the `sunxi_cam::SunxiCam` C++ methods with **our own** `self` object (Phase 2's `libcamtap` reused `ava`'s object; here `ava` is gone, so we allocate a fresh 16-byte `self` - `OpenCamera` from state 0 does the full V4L2 + ISP bring-up itself):
@@ -47,7 +60,7 @@ Result: ~12 fps, 0 misses, and the 698368-byte frame is full of real data (not e
 
 **The "illuminator/navigation trigger" was a red herring.** A raw `v4l2probe` `STREAMON` on `/dev/video1` returns *no* frames (DQBUF times out), which looked like the sensor only emits while navigating. But `w10-cam` (i.e. `libsunxicamera::SunxiCam::start`) gets frames immediately, docked - so the missing piece was the vendor library's full sensor **start sequence**, not the IR laser or motion. (Ruled out along the way: sensor exposure/gain - unchanged 0/16 during an active stream; the three exported output GPIOs 118/355/360 - constant `1/0/1` even when the ToF is live; the `V4L2_CID_ILLUMINATORS_1/2` controls - `S_CTRL` returns `EINVAL`.)
 
-Concurrency verified: RGB (`CAM_INDEX=2`) and ToF (`CAM_INDEX=1`) `w10-cam` run **at the same time**, both 60 frames / 0 misses, since they use separate ISPs (isp0 / isp1). To stream both at once, give each its own `CAM_SHM` + relay + go2rtc stream; the vendor's single-feed auto-switch (RGB docked / IR cleaning) uses one shm.
+Concurrency verified: RGB (`CAM_INDEX=2`) and ToF (`CAM_INDEX=1`) `w10-cam` run **at the same time**, both 60 frames / 0 misses, since they use separate ISPs (isp0 / isp1). Both-at-once is implemented in `noava-cam.sh start both`: each sensor gets its own `CAM_SHM` (`/tmp/camtap.shm` RGB, `/tmp/camtap_ir.shm` ToF) + its own `ava_cam_relay` (`IR_PORT=8090`/`8091`, path via the new `CAM_SHM` env) feeding one go2rtc as two named streams (`camera`, `camera_ir`). The vendor's single-feed auto-switch (RGB docked / IR cleaning) instead multiplexes one shm. Verified on the robot: both shm frame counters advance concurrently and go2rtc delivers a valid JPEG from each stream at once (RGB 672x504 color, IR 448x346 gray).
 
 Gotcha found the hard way: with **mop pads attached** the robot wets them at the dock first and only *then* moves - short "start cleaning" probes for the live ToF config looked like the ToF never activated. Detach the pads (vacuum mode) to bring the live ToF up quickly.
 
