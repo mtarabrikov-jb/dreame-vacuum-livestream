@@ -5,7 +5,8 @@ out-of-process relay. Together with the robot's go2rtc they produce one auto-swi
 RGB on the dock, infrared while cleaning** — without a cloud, without `video_monitor`, and without
 destabilizing navigation.
 
-> The long road here (the RGB camera won't stream during cleaning; the ToF stream is the only live feed
+> The long road here (the RGB camera won't stream while the LDS turret spins — as it does during
+> cleaning — because the spinning turret wedges its ISP, isp0; the ToF stream is the only live feed
 > then; the vendor `video_monitor` idles without a cloud trigger; CedarX H264 was too fragile; software
 > JPEG won) is documented in [`../docs/REVERSE_ENGINEERING.md`](../docs/REVERSE_ENGINEERING.md).
 

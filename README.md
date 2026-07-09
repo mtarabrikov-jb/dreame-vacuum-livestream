@@ -30,9 +30,11 @@ out-of-process relay — no cloud, no `video_monitor`, no second camera open:
   encoder: color 4:2:0 for RGB, grayscale for IR), and serves MJPEG on loopback `:8090`. The robot's
   **existing go2rtc** consumes that and re-serves it to you.
 
-The RGB camera being off during cleaning, and the ToF stream being the only live feed then, are both
-covered in the RE notes — as is why the vendor's `video_monitor` path can't be used (it waits for a
-cloud "start" command the de-clouded robot never sends).
+The RGB camera being unavailable during cleaning — the spinning **LDS turret** disrupts the OV8856 MIPI
+and wedges its ISP (isp0), so RGB and the LDS are mutually exclusive (it is the turret, not a firmware
+idle policy) — and the ToF stream being the only live feed then, are both covered in the RE notes — as
+is why the vendor's `video_monitor` path can't be used (it waits for a cloud "start" command the
+de-clouded robot never sends).
 
 ---
 

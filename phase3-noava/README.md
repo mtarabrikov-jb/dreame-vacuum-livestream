@@ -29,6 +29,10 @@ loop: GetImageFrame(self, &frame) -> data = *(void**)(frame+0x20) -> memcpy 5080
 
 The OpenCamera args were read live from `ava`'s memory (`libcamtap` statics `g_a1=2`, `g_fourcc="NV21"`, `g_a3=15`, cross-checked by `g_w/g_h=672/504`). `libsunxicamera` is self-contained for bring-up (it pulls in `libAWIspApi`/`libisp` and configures the media pipeline + ISP internally), so a plain V4L2 open is **not** enough - see below. Verified on the robot: ~12 fps, 0 misses, real color frames through go2rtc.
 
+**RGB needs the LDS turret parked.** The OV8856/isp0 pipeline and the LDS share nothing on paper, but a **spinning** LDS turret disrupts the OV8856 MIPI and **wedges isp0** - a continuous `[VIN_ERR] isp0 frame error, size 0` flood, and RGB stalls within seconds. So capture RGB only with the turret off (parked); RGB and `/scan` (turret spinning) are mutually exclusive. It is the turret, not motion - driving with the turret parked streams RGB fine.
+
+**Un-wedging isp0 off-dock (no `ava`, no reboot).** Once the turret has spun, isp0 stays wedged even after it stops - a plain reopen of `/dev/video2` keeps erroring `size 0`. To recover, send the MCU **camera-AI-reset** frame `0x1d [0x05, 0x00]` with the turret off and the RGB camera **closed**, then reopen `/dev/video2` -> isp0 recovers. Byte0 must be **`0x00`** (reset); `0x01` (what nav sends) does **not** clear it. RE'd from `node_signal.so` (`AvaNodeSignal::AIReset2ComProcess` -> `CastComMsg(0x1d, {0x05, byte0}, 2)`). This is what `ros2dreame`'s observe mode sends before opening video2.
+
 Env: `CAM_INDEX`(2) `CAM_W`(672) `CAM_H`(504) `CAM_A3`(15) `CAM_FOURCC`(NV21) `CAM_SHM`(/tmp/camtap.shm) `CAM_LIB`.
 
 ## IR / ToF - working
@@ -40,7 +44,7 @@ RGB:  ov8856(e3)   -> mipi.1 -> csi.1 -> isp0(e38) -> scaler.0/2 -> /dev/video0,
 ToF:  ofilm0092(e1)-> mipi.0 -> csi.0 -> isp1(e44) -> scaler.1   -> /dev/video1
 ```
 
-**Concurrency is possible** (verified): during a real cleaning `ava` runs **both** pipelines at once (isp0 for RGB, isp1 for ToF - separate MIPI/CSI/ISP/scaler, no shared bottleneck), and opening `/dev/video1` never disturbed the RGB capture on `/dev/video2`. The vendor's dock-vs-cleaning switch is a software choice, not a hardware limit.
+**Concurrency is possible** (verified): the RGB (isp0) and ToF (isp1) pipelines are fully independent - separate MIPI/CSI/ISP/scaler, no shared bottleneck - so both cameras can capture at once, and opening `/dev/video1` (ToF) never disturbs the RGB capture on `/dev/video2`. `ros2dreame` uses exactly this in its park-mode "both" (RGB `/camera` + IR `/camera_ir` together). **But this holds only with the LDS turret parked:** a spinning turret disrupts the OV8856 MIPI and wedges isp0 (see the RGB section above), so RGB is unavailable while the turret spins - as it does during real cleaning - a hardware limit, not an ISP conflict. So the RGB+ToF *feed* switch is a software choice; RGB-vs-`/scan` (spinning turret) is not.
 
 ToF format (RE'd from `ofilm0092` subdev + a live cleaning): sensor mbus **`0x3011`, 224x1558** all the way down the path; `/dev/video1` output is **MPLANE, `BG12`** (12-bit Bayer, 224x1558, `size = 224*1558*2`). Raw, ISP-passthrough - not the ISP-processed NV21 the RGB path produces. `ir_process.h` (Phase 2) decodes this 224x1558 frame (nine IR sub-frames) to grayscale.
 
@@ -139,4 +143,4 @@ Verified end-to-end (ava OFF): clean structured-light IR at ~10 fps, 0 misses, d
 
 ### Dead ends (do not re-investigate)
 
-MCU frames (replicated `ava`'s entire active MCU-tx incl. `SetCleaning 55 6e 50 00 03 00`), `SetCleaning` mode `0x03`, `0x1d 05 01` "laser enable" (`ava` sends it even docked with ToF off), sysfs/GPIO/regulator writes, `/dev/mem`, exposure/gain (`0/16` in both good and bad captures), the `V4L2_CID_ILLUMINATORS_1/2` controls, and a `STREAMON/STREAMOFF/STREAMON` double-cycle (this **hangs the VIN driver** - D-state + kernel oops, needs a reboot; do not do it). None of these were the lever - the lever was simply "is `ava` fully dead".
+MCU frames (replicated `ava`'s entire active MCU-tx incl. `SetCleaning 55 6e 50 00 03 00` = side 85, main 110, fan 80, **mop pads** 0, mode 3 - byte[3] is the rotating mop pads, the robot has no water pump), `SetCleaning` mode `0x03`, `0x1d 05 01` "laser enable" (`ava` sends it even docked with ToF off; note byte0=`0x01` here - the *RGB* isp0 un-wedge is the same `0x1d` frame with byte0=`0x00`, see the RGB section), sysfs/GPIO/regulator writes, `/dev/mem`, exposure/gain (`0/16` in both good and bad captures), the `V4L2_CID_ILLUMINATORS_1/2` controls, and a `STREAMON/STREAMOFF/STREAMON` double-cycle (this **hangs the VIN driver** - D-state + kernel oops, needs a reboot; do not do it). None of these were the lever - the lever was simply "is `ava` fully dead".

@@ -13,8 +13,10 @@ Placeholders: `<robot-ip>` = your robot's LAN address; `root@<robot-ip>` = its S
 >   (`SunxiCam` OpenCamera → GetImageFrame + **ReturnImageFrame**), serialized with `ava` by a mutex.
 >   The RGB "black frame" scare was just a dark room.
 > - **While cleaning:** grayscale infrared, by passively tapping the ToF sensor (`/dev/video1`) that
->   `ava` runs for obstacle avoidance. The RGB camera genuinely does **not** stream while cleaning
->   (that part of the notes stands) — infrared is what's available then.
+>   `ava` runs for obstacle avoidance. The RGB camera does **not** stream while cleaning — but the cause
+>   is the **spinning LDS turret** wedging its ISP (isp0), not an "active-mode" firmware gate (that
+>   reading is superseded — see §"Correction" below). Infrared is what's available while the turret
+>   spins.
 > - **Encode/serve:** software baseline JPEG (color, and grayscale-as-YCbCr for IR) → MJPEG → the
 >   robot's go2rtc. The CedarX H264 path (sections below) was abandoned as too fragile.
 > See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the final design.
@@ -201,8 +203,10 @@ it streams the whole time it cleans.
 4. Rotate 180° (the ToF sensor is mounted rotated), then encode → MJPEG → go2rtc.
 
 **Resolution (this is what shipped).** This is a genuine live view of the robot cleaning — in
-**infrared**, not RGB. The watchable RGB camera *is* kept off during autonomous cleaning by the
-firmware (proven three ways above), so infrared is the only cleaning-time feed; that limit stands.
+**infrared**, not RGB. RGB is unavailable during autonomous cleaning because cleaning spins the LDS
+turret, which wedges its ISP (isp0) — see §"Correction" below, which superseded the earlier "firmware
+keeps it idle" reading. Either way the turret is spinning while cleaning, so infrared is the only
+cleaning-time feed; that limit stands.
 What changed vs the pessimistic wording that used to be here:
 - The dock view **is** RGB after all — see the RGB-on-dock section below. RGB never streams *while
   cleaning*, but on the dock we drive it ourselves.
@@ -211,6 +215,38 @@ What changed vs the pessimistic wording that used to be here:
   encoder (color for RGB, grayscale-as-YCbCr for IR) → MJPEG → go2rtc is robust and fully controlled.
 
 So the deliverable is a single go2rtc stream: RGB on the dock, infrared while cleaning.
+
+### Correction (superseded): the blocker is the spinning LDS turret, not an active-mode firmware gate
+
+The reasoning above concluded that the RGB pipeline is "gated off below software control (power/clock/
+firmware policy)" whenever the robot is in any active mode. **That conclusion is wrong.** Re-verified
+later with `ava` provably dead (all four `ava` watchdogs frozen — an earlier `ava`-respawn confound is
+exactly what made this look like an "active-mode" policy), the real cause of the
+`[VIN_ERR] isp0 frame error, size 0` flood is the **spinning LDS turret**:
+
+- **The turret, not the mode.** With the turret **parked**, RGB streams cleanly (0 isp0 errors) — even
+  while driving (`ros2dreame`'s `W10_NO_TURRET=1` drives with RGB+IR and 0 isp0 errors). With the turret
+  **spinning**, it disrupts the OV8856 MIPI (the horizontal-blank timing jitters ~2x; no regulator/clock
+  change is logged at the transition, so it is physical — turret-motor EMI / shared-rail droop, not a
+  firmware mode switch) and RGB stalls within seconds. So RGB and `/scan` (turret spinning) are
+  **mutually exclusive**; RGB-vs-*motion* was never the trade-off. Cleaning happens to spin the turret,
+  which is why RGB is unavailable during cleaning.
+- **It wedges isp0 persistently.** Once the turret has spun, a plain reopen of `/dev/video2` keeps
+  erroring `size 0` even after the turret stops. It does **not** clear by waiting, reopening, a
+  proactive stop-before-turret, a VIN unbind (which oopses the driver), the `resetsync` ioctl, or
+  persistent streaming.
+- **Off-dock un-wedge (solved — no `ava`, no reboot).** Send the MCU **camera-AI-reset** frame
+  `0x1d [0x05, 0x00]` with the turret off and the RGB camera **closed**, then reopen `/dev/video2` —
+  isp0 recovers and RGB streams clean. Byte0 must be **`0x00`** (reset); `0x01` (what nav sends) does
+  **not** clear it. Found by disassembling `node_signal.so`:
+  `AvaNodeSignal::AIReset2ComProcess(ava_camera_ai_reset_msg*)` builds `CastComMsg(0x1d, {0x05, byte0}, 2)`
+  (siblings: `{0x04,..}` = stereo cam, `{0x01,..}` = ToF).
+
+This supersedes the "manual/remote-control mode is the same" and "gated off below software control"
+readings above — both were taken with the turret spinning. The two ISPs are still independent (the ToF
+on isp1 is unaffected) and the RGB↔ToF concurrency finding stands — see
+[`../phase3-noava/README.md`](../phase3-noava/README.md). This is how `ros2dreame` streams RGB with the
+turret parked and recovers a turret-wedged isp0 off-dock.
 
 ## 5a. H264 encoder (CedarX `libvencoder.so`)
 

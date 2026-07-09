@@ -10,9 +10,13 @@ MSE, whose content **auto-switches with the robot's state** and **never destabil
 
 ## Why it's built this way
 
-The W10 will not stream its RGB camera during cleaning — the firmware keeps the OV8856 idle then and
-uses the separate ToF sensor for obstacle avoidance (proven in
-[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#on-device-test-result-the-real-blocker-the-rgb-camera-does-not-stream-during-cleaning)).
+The W10 will not stream its RGB camera while it is cleaning — but not because of a firmware idle
+policy. Cleaning spins the **LDS turret** (for navigation), and the spinning turret disrupts the
+OV8856's MIPI link and **wedges its ISP** (isp0): a continuous `[VIN_ERR] isp0 frame error, size 0`
+flood, and RGB stalls within seconds. So RGB and the spinning LDS are **mutually exclusive** — it is
+the turret, not motion — and the separate ToF sensor on its own ISP (isp1) provides the cleaning-time
+view (proven in
+[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#correction-superseded-the-blocker-is-the-spinning-lds-turret-not-an-active-mode-firmware-gate)).
 The vendor's `video_monitor` streamer can't help either: on a de-clouded (Valetudo) robot it idles
 forever waiting for an Agora "start" command that never arrives. So both feeds are produced from
 **inside `ava`** instead:

@@ -17,6 +17,15 @@
 
 Both feeds die together. Per [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) §3, the dock RGB feed (`/dev/video0`) and the cleaning IR feed (`/dev/video2`) are **the same physical OV8856 sensor** on different scaler outputs, so a single sensor/link fault takes out RGB and IR at once.
 
+### Two causes — rule out the spinning LDS turret first
+
+The `isp0 frame error, size 0` flood has **two** distinct causes that produce the **same** `dmesg` signature. Check the common, software-recoverable one before opening the robot:
+
+1. **Spinning LDS turret (common; software/operational; recoverable).** `isp0` is the OV8856 **RGB** camera pipeline. A **spinning LDS turret** disrupts the OV8856 MIPI and **wedges isp0** — the exact `size 0` flood — through turret-motor EMI / shared-rail droop (the horizontal-blank timing jitters ~2x; no regulator/clock change is logged at the transition). This is operational, not a fault: it appears whenever the turret is spinning (navigation / cleaning) and RGB works again once the turret is parked. **Tell it apart from the cable fault:** if the flood is present only while the robot is navigating (turret spinning) and RGB is fine docked/parked, it is the turret, not the FPC. Recovery, no teardown:
+   - **Park the turret** — stop navigation / re-dock; RGB recovers on the next open.
+   - **Off-dock, no `ava`, no reboot:** send the MCU camera-AI-reset frame `0x1d [0x05, 0x00]` with the turret off and the RGB camera closed, then reopen it — isp0 recovers. Byte0 must be `0x00`; `0x01` (what nav sends) does not clear the wedge. This is what `ros2dreame`'s observe mode does — see [`../phase3-noava/README.md`](../phase3-noava/README.md) and [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md#correction-superseded-the-blocker-is-the-spinning-lds-turret-not-an-active-mode-firmware-gate).
+2. **OV8856 FPC-cable hardware fault (rarer; physical).** If the flood persists **with the turret parked / docked** — RGB dead even when it should work, and it does not clear on reboot — the turret is ruled out and the cause is the camera flex cable. That diagnosed incident and its reseat fix are the rest of this entry, below.
+
 ### Root cause (observed incident, 2026-07-07)
 
 **Hardware fault in the OV8856 MIPI-CSI high-speed data path — the camera flex (FPC) cable.** The failure began mid-cleaning (camera froze at 07:55 UTC, i.e. `/tmp/camtap.shm` mtime stuck there); vibration/movement during cleaning pushed a marginal connection over the edge.
