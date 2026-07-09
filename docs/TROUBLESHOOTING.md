@@ -15,7 +15,7 @@
   ```
 - `ava` pegs one core (~60% CPU, load ~5-6) — its ToF/vision threads (`TofThread`, `TofMapAcc`, `SlamAsync`) busy-loop retrying the dead camera. This is worst during cleaning (when `ava` drives the sensor hardest) and eases when docked-idle, but the `VIN_ERR` flood continues regardless.
 
-Both feeds die together. Per [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) §3, the dock RGB feed (`/dev/video0`) and the cleaning IR feed (`/dev/video2`) are **the same physical OV8856 sensor** on different scaler outputs, so a single sensor/link fault takes out RGB and IR at once.
+The `dmesg` above is entirely `isp0` / `ov8856_mipi` — the **RGB** pipeline (OV8856). Per [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) §3 "Camera topology": the dock feed (`/dev/video0`) and `ava`'s cleaning-time AI camera (`/dev/video2`) are two scaler outputs of the **one OV8856** RGB sensor on `isp0`, so an OV8856 / MIPI-link fault takes out **all** of RGB at once. **Note:** `/dev/video2` is **RGB, not IR** — the cleaning-time **IR/ToF** view is a *separate* sensor, `ofilm0092`, on its own ISP (`isp1`), `/dev/video1`, which an OV8856 fault does **not** inherently affect. (An earlier version of this line mislabeled `/dev/video2` as the IR feed and called RGB+IR "the same sensor" — that was wrong; see §3 and [`../phase3-noava/README.md`](../phase3-noava/README.md) for the verified pipeline.)
 
 ### Two causes — rule out the spinning LDS turret first
 
